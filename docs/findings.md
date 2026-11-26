@@ -65,6 +65,37 @@ in that order of size:
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
 
+## Pixelated lit characters and shadows (RTX 5080, Series S profile, 2026-11-26)
+
+Looked at with `VICTORY_DUMP_TARGETS` (every target a frame writes, 1280x720 under a 1080p output):
+
+- **Not the upscaler.** `TAA2U:CS_TAA2_Resolve` (22f4971293b8fdcc) translates exactly (no wave exchange, no
+  retry form); the title ping-pongs its two 1920x1080 history pairs and our host keeps each between frames;
+  the stipple it takes in (hair is a visibility buffer, `hair_resolve:CS_ResolveToGBufferTiled_*`, resolved
+  with a different dither every frame) comes out frame to frame stable in the cell: |frame N - frame N+1| of
+  the lit hair 2.4 against 1.4 for film grain alone.
+- **Not the ambient stand-in.** `VICTORY_AMBIENT_SHADE=0` against the default: the same noise in matching
+  scenes (walls 1.68 and 1.68, shirt 1.68 and 1.68, 0..255 luma, neighbour difference).
+- **Shadows are the title's shadow maps, and small ones.** In the frame with a light on the character the
+  atlas of its local lights had a 128x64 and a 64x64 corner of its 1024x1024 used (probably two paraboloid
+  halves of 64x64 a side); the sun's cascades about 1220x215 and 1080x200 texels of 2304x576. The character's
+  shadow on a wall in that frame is a blob with steps of some 20 to 50 output pixels. The title also traces a
+  half-resolution shadow mask (`sr_tracing:CS_RaytraceShadows_Mixed`, 640x360), whose rays all miss here
+  (`VICTORY_BVH_MISS=1`); the structure builder that would give them something to hit cannot run on 32-lane
+  waves: 3 of its 53 programs (39321a95223001ed, 77360df21e12ea43, 9fc111d3be79364f) do not translate ("a
+  first-lane read where not every lane runs"). Whether the title makes these maps bigger on Series X is not
+  known (it does not run here).
+- **Six lighting programs translated only in an approximate form** (`VICTORY_WAVE_WHY=1`, host wave 32):
+  `shadowmask:CS_GenerateShadowMasks_HairOnly`, `tiled_lighting:CS_ClusterLightsWorldSpace` (both local
+  waves, any mask: each host wave gives its own half of a console wave's result) and four
+  `cascadeshadows_rendering:CS_ShadowRenderTiled*PPPC` rasterizers. The first two have a thread group of one
+  console wave and translate exactly with the wave-wide form, which is now on for them by default
+  (`VICTORY_WAVE_WIDE=0`: as before). `VICTORY_WAVE_WIDE=1` for every program lost the card about a minute into
+  a run (device removed; which program was not found): not safe for the others. Whether the approximate forms were the
+  cause of anything seen is not shown.
+- Not looked at here: NVIDIA Smooth Motion (the launcher's default) interpolates frames the capture does not
+  see; `-NoSmoothMotion` is the check.
+
 ## Measured and not worth it
 
 - Unordered early pipelines for everything (AMD's compiler crashed).
