@@ -81,10 +81,14 @@ Looked at with `VICTORY_DUMP_TARGETS` (every target a frame writes, 1280x720 und
   halves of 64x64 a side); the sun's cascades about 1220x215 and 1080x200 texels of 2304x576. The character's
   shadow on a wall in that frame is a blob with steps of some 20 to 50 output pixels. The title also traces a
   half-resolution shadow mask (`sr_tracing:CS_RaytraceShadows_Mixed`, 640x360), whose rays all miss here
-  (`VICTORY_BVH_MISS=1`); the structure builder that would give them something to hit cannot run on 32-lane
-  waves: 3 of its 53 programs (39321a95223001ed, 77360df21e12ea43, 9fc111d3be79364f) do not translate ("a
-  first-lane read where not every lane runs"). Whether the title makes these maps bigger on Series X is not
-  known (it does not run here).
+  (`VICTORY_BVH_MISS=1`); the structure builder that would give them something to hit could not run on 32-lane
+  waves: 3 of its 53 programs (39321a95223001ed, 77360df21e12ea43, 9fc111d3be79364f) did not translate ("a
+  first-lane read where not every lane runs"). The programs of `XboxBvhBuilder.dll` that stopped there are three
+  block scans over 512, 512 and 256 threads (translate hashes #dc78c5de69c7c155, #322ed4ad832bdea6,
+  #d441b097704ab616; the pipelines' hashes in a run's log are of the title's own copies); their loop over the
+  waves below now translates exactly (`emit/wave_alike.rs`, docs/fork-ray-tracing.md), the builder
+  runs on an RTX 5080 (53 of 53 pipelines), and what that does is measured in the same document. Whether the
+  title makes these maps bigger on Series X is not known (it does not run here).
 - **Six lighting programs translated only in an approximate form** (`VICTORY_WAVE_WHY=1`, host wave 32):
   `shadowmask:CS_GenerateShadowMasks_HairOnly`, `tiled_lighting:CS_ClusterLightsWorldSpace` (both local
   waves, any mask: each host wave gives its own half of a console wave's result) and four
@@ -93,6 +97,13 @@ Looked at with `VICTORY_DUMP_TARGETS` (every target a frame writes, 1280x720 und
   (`VICTORY_WAVE_WIDE=0`: as before). `VICTORY_WAVE_WIDE=1` for every program lost the card about a minute into
   a run (device removed; which program was not found): not safe for the others. Whether the approximate forms were the
   cause of anything seen is not shown.
+- A seventh, found while checking what `emit/wave_alike.rs` changes in the title's 26,084 programs:
+  `water_interaction_foam:CS_DisturbersContribution_d51b035d_Wrapped` (1a61a99e8379f7d6) also translates only in
+  the approximate form of local waves (first-lane reads of float values where not every lane runs). A first,
+  broader form of that proof (any vector ALU instruction without a cross-lane step) made it translate in the
+  original form, but also accepted accumulating instructions (`v_fmac`) whose old value the IR does not list as
+  an operand; the proof that is in is integer-only, so this program is as it was (approximate), and no other
+  program of the title changes its translation.
 - Not looked at here: NVIDIA Smooth Motion (the launcher's default) interpolates frames the capture does not
   see; `-NoSmoothMotion` is the check.
 
