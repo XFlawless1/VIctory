@@ -81,6 +81,8 @@
 //!   It binds nothing.
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod block_scan_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
@@ -111,6 +113,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod wave_alike;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};

@@ -41,7 +41,19 @@ shaders and emulates the one instruction.
    7900 XTX; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
-   accesses, and several control-flow shapes.
+   accesses, and several control-flow shapes. On a GPU of 32-lane waves (an
+   RTX 5080) three of the 52 were refused ("a first-lane read where not every
+   lane runs"): the block scans over 512, 512 and 256 threads, in which every
+   wave past the first adds the totals of the waves below it in a loop of
+   `w` rounds, handing the running sum on through `v_readfirstlane`. The
+   loop's two host waves per console wave cannot meet inside it (a group
+   barrier in a branch only some waves take hangs the group), and need not:
+   `emit/wave_alike.rs` proves that the value read is the same in every lane
+   (a scalar plus a read of group-shared memory at a scalar's address, after
+   the group's barrier, nothing writing group-shared memory later), so a host
+   wave's own first live lane is the console's. All 53 pipelines then have host
+   pipelines there. Exact, not approximate; refused as before wherever the
+   proof does not hold (`VICTORY_FIRSTLANE_ALIKE=0` turns it off).
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
@@ -92,6 +104,7 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_FIRSTLANE_ALIKE=0` | 32-lane waves: a first-lane read where not every lane runs is refused as before, whatever it reads (the builder's three block scans then do not translate, and the builder stays off) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
@@ -106,6 +119,32 @@ dispatches, faults and what came.
 
 ## Known gaps
 
+- On an RTX 5080 (Series S profile, prison cell, 2026-11-27: six runs of one
+  build, four with `VICTORY_BVH_BUILDER=1 VICTORY_BVH_MISS=0`, two without;
+  a diagnostics build, scripted keys): the builder runs (53 of 53 pipelines) in
+  every run, and none lost the card, died, or rested. It is slower, and by how
+  much varies: the world frame (median of the last 120 s) was 40.2 and 43.0 ms
+  without it, 49.9 ms with it in one run (44-47 at the end) and 112 ms with the
+  same settings in another, where the card was busy about 95 ms of it and the
+  frame switched between some 50 and 100-250 ms from 150 s on; with
+  `VICTORY_BVH_QUARANTINE=1` 53 ms (a short steady stretch); the card's busy
+  time a frame (frame less the card's idle time in its own clock) 19-23 ms
+  without, 33 ms in the lighter run, 60-100 in the other. The shadows'
+  half-resolution masks (the 640x360 `f57` targets of frame 3000,
+  `VICTORY_DUMP_TARGETS`, 320x180 as saved) have 0.4 % and 1.3 % of their
+  pixels below 200/255 without the builder and 12.8 % and 43 % with it: rays
+  find things now. (Which file is `CS_RaytraceShadows_Mixed`'s output was not
+  pinned down.) The picture does not gain: rooms are darker (the ambient
+  stand-in is off while the builder runs and the probes' own light is what is
+  left), and the lit hair's edge keeps its blocky stipple at full size. So
+  `scripts/play-nvidia.ps1` keeps the builder off. An arena dump 6 minutes in
+  (frame 4917, every 256-byte aligned place with a version-6 header, a
+  plausible size and finite bounds): 2,366 structures, 1,173 of them dynamic (neither
+  rehydrated nor packed), 912 of which lie in another's extent, the gap
+  below (7900 XTX: 8 of 65 and 48 of 275 good; here 261 of 1,173); two of the
+  four top-level structures the dump lists as given to trace programs had no
+  page in it. What the block scans compute was tested on the card only in a
+  program of their shape (`block_scan_tests.rs`), not in the title.
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
   structure's compacted size, reads it one or two frames later without looking
