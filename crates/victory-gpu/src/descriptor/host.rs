@@ -799,6 +799,58 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Title memory the title wrote through a view, in a block of a texture
+/// picked by index that is under a look, since a pass last took the ranges
+/// (`crate::watch::faulted`: the write faulted into a guard that a copy of
+/// the texture's memory left there). Kept apart from [`REMAPPED`]: only the
+/// slots uploaded before are made due by it, from the next frame on.
+static FAULTED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start: slots of uploaded textures that a write fault made due.
+pub(crate) static FAULTED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the start, of the ranges passes took ([`HostHeap::slots_faulted_in`]):
+/// how many (joined), the slots whose texture lies under them, of those
+/// the ones no table's draws read lately, and of those the ones uploaded
+/// before.
+pub(crate) static FAULT_STEPS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The title wrote title memory `[at, at + len)`, which a guard that a copy
+/// of a texture picked by index left there caught (`crate::watch::faulted`).
+/// Kept for the next texture pass ([`HostHeap::texture_slots_faulted`]).
+/// Called from the handler of the write fault: locks one mutex of its own and
+/// calls nothing.
+pub(crate) fn faulted(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 12;
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = FAULTED.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len() >= MOST {
+        // No pass runs: the slots are looked at when they are due.
+        crate::watch::FAULT_NOTICES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    #[cfg(feature = "diagnostics")]
+    if ranges.is_empty() {
+        FAULT_SINCE.store(crate::frame::current(), Relaxed);
+    }
+    ranges.push((start, end));
+}
+
+/// Diagnostics: the frame of the oldest range [`FAULTED`] holds.
+#[cfg(feature = "diagnostics")]
+static FAULT_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Diagnostics, since the start: passes that took ranges [`FAULTED`] held, by
+/// the frames since the write that came first (0, 1, 2, 3 or more).
+#[cfg(feature = "diagnostics")]
+pub(crate) static FAULT_LAG: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -948,6 +1000,17 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// The slots that wait for a look ([`TextureQueue::recheck`]) by where their
+    /// memory is: (its start, the slot) and its end. The spans of
+    /// [`Spans`] hold placed textures only, and the textures the title
+    /// fills as objects at addresses it mapped (which are most of what looks
+    /// find changed) lie in none: this is where a write to some memory
+    /// finds their slots ([`TextureQueue::looking_in`]). An entry is good
+    /// while the slot still waits for a look at that memory; others are let
+    /// go when found.
+    looking: std::collections::BTreeMap<(u64, u32), u64>,
+    /// The longest memory in `looking`, in bytes.
+    longest: u64,
 }
 
 impl TextureQueue {
@@ -1069,16 +1132,59 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+        let Some(w) = self.same(index, write) else {
+            return;
+        };
+        let before = w.checked;
+        (w.due, w.looks, w.mapped) = (due, 1, 0);
+        w.checked = (at.0, at.1, print, looks, uploaded);
+        if before.2 != 0 && before.0 != at.0 {
+            self.looking.remove(&(before.0, index));
         }
+        self.looking.insert((at.0, index), at.0.saturating_add(at.1));
+        self.longest = self.longest.max(at.1);
+        // Entries of slots that left the queue are let go when a write finds
+        // them; if none does, now and then all at once.
+        if self.looking.len() > 2 * self.slots.len() + 4096 {
+            let slots = &self.slots;
+            self.looking
+                .retain(|&(at, slot), _| slots.get(&slot).is_some_and(|w| w.checked.2 != 0 && w.checked.0 == at));
+        }
+    }
+
+    /// The slots waiting for a look whose memory has bytes in `[start,
+    /// end)`: where the title wrote, for the slots of texture objects too.
+    fn looking_in(&mut self, start: u64, end: u64) -> Vec<u32> {
+        let from = (start.saturating_sub(self.longest), 0);
+        let (mut found, mut gone) = (Vec::new(), Vec::new());
+        for (&(at, slot), &stop) in self.looking.range(from..(end, 0)) {
+            if stop <= start {
+                continue;
+            }
+            match self.slots.get(&slot) {
+                Some(w) if w.checked.2 != 0 && w.checked.0 == at => found.push(slot),
+                _ => gone.push((at, slot)),
+            }
+        }
+        for key in gone {
+            self.looking.remove(&key);
+        }
+        found
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
     fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    }
+
+    /// The title wrote in the memory of slot `index`'s texture, which is
+    /// waiting for a look ([`TextureQueue::recheck`]): the look is due from
+    /// frame `due` at the latest, and what it was told stays.
+    fn look_soon(&mut self, index: u32, due: u64) {
+        if let Some(w) = self.slots.get_mut(&index).filter(|w| w.checked.2 != 0) {
+            w.due = w.due.min(due);
+        }
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1793,7 +1899,7 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN) || noted(&FAULTED))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1834,6 +1940,10 @@ impl HostHeap {
         looks: u8,
         uploaded: u64,
     ) {
+        // Under a look: a write fault in a block of it is told from now on
+        // ([`faulted`]), and the blocks the last fault opened are guarded
+        // again.
+        crate::watch::texture_look(at.0 as usize, at.1 as usize);
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
@@ -1917,6 +2027,92 @@ impl HostHeap {
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         BAKE_WOKEN.fetch_add(at_once, Relaxed);
         slots.len()
+    }
+
+    /// Takes the ranges the title wrote through a view since the last call
+    /// ([`faulted`]) and brings forward to the next frame the look of every
+    /// uploaded texture that has bytes there and is waiting for one
+    /// ([`TextureQueue::look_soon`]: the look compares a fingerprint of 48
+    /// KiB and uploads again only what it finds changed, so a neighbour's
+    /// write in the same block costs that); one out of the queue, or uploaded
+    /// in part, is made due as memory the runtime wrote is
+    /// ([`HostHeap::texture_slots_remapped`]). At once in the pass before a
+    /// draw of the bake (`baking`), whose texture takes what is there for
+    /// good. A slot still waiting for its first upload is left as it is: that
+    /// upload takes the bytes that are there by then. Slots tables read are
+    /// left to their draws. Returns how many slots it acted on.
+    pub(crate) fn texture_slots_faulted(&self, frame: u64, baking: bool) -> usize {
+        let mut ranges = std::mem::take(&mut *FAULTED.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let lag = frame.saturating_sub(FAULT_SINCE.load(std::sync::atomic::Ordering::Relaxed)).min(3);
+            FAULT_LAG[lag as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        join(&mut ranges);
+        self.slots_faulted_in(&ranges, frame, baking)
+    }
+
+    /// [`HostHeap::texture_slots_faulted`] for `ranges`, joined.
+    fn slots_faulted_in(&self, ranges: &[(u64, u64)], frame: u64, baking: bool) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The placed textures that have bytes in the ranges: the 4 KiB pages
+        // the title wrote first in blocks it opened.
+        let mut placed_slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        placed_slots.sort_unstable();
+        placed_slots.dedup();
+        let due = if baking { frame } else { frame + 1 };
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        // The slots waiting for a look, by where their memory is (placed
+        // textures, and the objects the title fills at addresses it mapped:
+        // `Spans` holds the first only, and the faults that told of the
+        // others woke none): looked at in this pass, whatever the age
+        // of their next look says. A look reads 48 KiB, and uploads again only
+        // what it finds changed. So for one that a table's draws read within
+        // the last 240 frames: a read takes a slot out of the queue, so one
+        // that is in it and looked at has not been read through a table since
+        // it was queued, and no draw is there to keep it fresh.
+        let mut waiting: Vec<u32> = ranges.iter().flat_map(|&(start, end)| textures.looking_in(start, end)).collect();
+        waiting.sort_unstable();
+        waiting.dedup();
+        FAULT_STEPS[0].fetch_add(ranges.len() as u64, Relaxed);
+        FAULT_STEPS[1].fetch_add(waiting.len() as u64, Relaxed);
+        let mut uploaded = 0;
+        for &slot in &waiting {
+            textures.look_soon(slot, frame);
+            #[cfg(feature = "diagnostics")]
+            crate::watch::seen::woken(slot, frame);
+        }
+        for &slot in placed_slots.iter().filter(|slot| waiting.binary_search(slot).is_err()) {
+            // (Whether it waits for a look, and whether it was uploaded in part.)
+            match textures.slots.get(&slot).map(|w| (w.checked.2 != 0, w.mapped > 0)) {
+                Some((true, _)) => {
+                    textures.look_soon(slot, frame);
+                    FAULT_STEPS[2].fetch_add(1, Relaxed);
+                }
+                // Uploaded in part, or out of the queue and uploaded before:
+                // as memory the runtime wrote, but not a table's, which are
+                // out of the queue for their draws.
+                Some((false, true)) | None if !self.tabled_lately(slot, frame) => {
+                    textures.changed(slot, frame, due);
+                    uploaded += 1;
+                }
+                // Waiting for its first upload, or for its memory (that
+                // takes the bytes that are there by then), or a table's.
+                _ => continue,
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::watch::seen::woken(slot, frame);
+        }
+        FAULT_STEPS[2].fetch_add(waiting.len() as u64, Relaxed);
+        FAULT_STEPS[3].fetch_add(uploaded, Relaxed);
+        FAULTED_SLOTS.fetch_add(waiting.len() as u64 + uploaded, Relaxed);
+        waiting.len() + uploaded as usize
     }
 
     /// Makes the slots of the textures filled with less than was mapped
@@ -2485,6 +2681,33 @@ impl HostHeap {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+    }
+
+    /// Diagnostics: what stands between a write fault at `[at, at + len)` and
+    /// the wake of title slot `index`'s look in `frame` (`slots_faulted_in`):
+    /// whether its texture's span is under the range, whether a table's draws
+    /// read it lately, and what the queue holds of it (due frame, looks,
+    /// bytes mapped, whether it waits for a look).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn why_not_woken(&self, index: u32, frame: u64, at: u64, len: u64) -> String {
+        let in_span = self.placed.lock().unwrap_or_else(|e| e.into_inner()).slots_in(at, at + len).contains(&index);
+        let entry = self
+            .textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slots
+            .get(&index)
+            .map(|w| (w.due, w.looks, w.mapped, w.checked.2 != 0));
+        format!(
+            "under the range by its span: {in_span}, read through tables lately: {}, queue entry (due, looks, mapped, waits for a look): {entry:?}",
+            self.tabled_lately(index, frame)
+        )
+    }
+
+    /// Diagnostics: whether `tabled_lately` says so of `index` in `frame`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tabled_lately_for_notes(&self, index: u32, frame: u64) -> bool {
+        self.tabled_lately(index, frame)
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -5559,6 +5782,133 @@ mod tests {
         // Only the one in a bake counts as woken at once (other tests may
         // add to the count when they run: at least that one).
         assert!(woken() > before);
+    }
+
+    /// A write fault on a guarded block of an uploaded texture brings its
+    /// slot's look to the pass that takes the note, keeping what the look
+    /// compares, also if a table's draws read the slot lately; a slot out of
+    /// the queue is uploaded again as memory the runtime wrote is (from the
+    /// next frame, at once in a bake), unless it is a table's; one still
+    /// waiting for its first upload, and one not under the 4 KiB written, are
+    /// left alone. (Ranges are handed over directly: the list `faulted`
+    /// keeps is shared with other tests.)
+    #[test]
+    fn a_write_fault_brings_the_look_of_an_uploaded_texture_forward() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no other test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let written = [(at + 0x100, at + 0x1100)];
+        // Waiting for its first upload: left as it is.
+        assert_eq!(heap.slots_faulted_in(&written, 50, false), 0);
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 1);
+        // Uploaded whole and looked at again in 4 frames: the fault brings the
+        // look to this pass, with what it compares kept.
+        let print = 7;
+        heap.texture_slot_recheck(1, write, 54, (at, 0x2000), print, 0, 49);
+        assert_eq!(slots(50), []);
+        assert_eq!(heap.slots_faulted_in(&written, 50, false), 1);
+        assert_eq!(slots(50), [1]);
+        assert_eq!(heap.texture_slot_checked(1), Some((at, 0x2000, print, 0, 49)));
+        // A write in the same block that is not in the texture's bytes
+        // does not (its range ends where the texture starts).
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_recheck(1, write, 99, (at, 0x2000), print, 1, 49);
+        assert_eq!(heap.slots_faulted_in(&[(at - 0x1000, at)], 55, false), 0);
+        assert_eq!(slots(55), []);
+        // A table's draws read it lately (and it was queued again after the
+        // read, as a write of its view does): the look is brought forward.
+        heap.tabled_in(1, false, 56);
+        assert_eq!(heap.slots_faulted_in(&written, 60, false), 1);
+        assert_eq!(slots(60), [1]);
+        // Uploaded and out of the queue, and a table's: left to its draws.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_faulted_in(&written, 61, false), 0);
+        assert_eq!(slots(u64::MAX), []);
+        // Not so for long: as good as uploaded before, and written afresh
+        // (nothing is known of what a look would compare), from the next frame.
+        assert_eq!(heap.slots_faulted_in(&written, 70 + TABLED_FRAMES, false), 1);
+        assert_eq!(slots(70 + TABLED_FRAMES), []);
+        assert_eq!(slots(71 + TABLED_FRAMES), [1]);
+        assert!(heap.texture_slot_checked(1).is_none());
+        // In a bake, at once.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_faulted_in(&written, 80 + TABLED_FRAMES, true), 1);
+        assert_eq!(slots(80 + TABLED_FRAMES), [1]);
+        // Memory elsewhere: nothing.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_faulted_in(&[(at + 0x10_0000, at + 0x10_1000)], 90 + TABLED_FRAMES, true), 0);
+        assert_eq!(slots(u64::MAX), []);
+    }
+
+    /// A write finds the slots waiting for a look by where their memory is,
+    /// whether a span holds them or not (a texture object the title fills at
+    /// an address it mapped is in none), and their looks are brought forward
+    /// with what they compare kept.
+    #[test]
+    fn writes_find_the_slots_of_textures_that_lie_in_no_span() {
+        let mut queue = TextureQueue::default();
+        queue.written(7, 40, 41, false);
+        let (index, write) = queue.due(u64::MAX, 8)[0];
+        assert_eq!(index, 7);
+        let at = (0x7feb_0000_0000u64, 0x4_0000u64);
+        queue.recheck(7, write, 90, at, 5, 0, 40);
+        // Under it, and not at its end, nor before it.
+        assert_eq!(queue.looking_in(at.0 + 0x3_0000, at.0 + 0x3_1000), [7]);
+        assert!(queue.looking_in(at.0 + 0x4_0000, at.0 + 0x4_1000).is_empty());
+        assert!(queue.looking_in(at.0 - 0x1000, at.0).is_empty());
+        assert_eq!(queue.looking_in(at.0 - 0x1000, at.0 + 1), [7]);
+        // Its look is due now, and compares what it did.
+        assert!(queue.due(50, 8).is_empty());
+        queue.look_soon(7, 50);
+        assert_eq!(queue.due(50, 8), [(7, write)]);
+        assert_eq!(queue.checked(7), Some((at.0, at.1, 5, 0, 40)));
+        // Looked at in other memory: the entry of the old goes.
+        let moved = (at.0 + 0x100_0000, 0x4_0000);
+        queue.recheck(7, write, 90, moved, 6, 1, 51);
+        assert!(queue.looking_in(at.0, at.0 + 0x4_0000).is_empty());
+        assert_eq!(queue.looking_in(moved.0, moved.0 + 1), [7]);
+        // Out of the queue: no slot is there, and the entry goes when found.
+        queue.done(7, write);
+        assert!(queue.looking_in(moved.0, moved.0 + 1).is_empty());
+        assert!(queue.looking.is_empty());
+    }
+
+    /// The note a write fault leaves ([`faulted`]) is taken by the next pass
+    /// ([`HostHeap::texture_slots_faulted`]), which brings forward the look of
+    /// a slot that no span holds (what `crate::watch::faulted` tells).
+    #[test]
+    fn a_fault_told_wakes_the_look_of_a_slot_no_span_holds() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // Memory no other test and no title uses.
+        let at = 0x7fe9_0000_0000u64;
+        heap.textures.lock().unwrap_or_else(|e| e.into_inner()).written(5, 10, 11, false);
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 5);
+        heap.texture_slot_recheck(5, write, 99, (at, 0x4_0000), 3, 0, 10);
+        // (The spans of views made are what lets a note in.)
+        SPANNED[0].fetch_min(at, Relaxed);
+        SPANNED[1].fetch_max(at + 0x4_0000, Relaxed);
+        faulted((at + 0x2_3000) as usize, 0x1000);
+        assert_eq!(heap.texture_slots_faulted(20, false), 1);
+        let due: Vec<u32> = heap.texture_slots_due(20, 8).0.into_iter().map(|d| d.0).collect();
+        assert_eq!(due, [5]);
+        assert!(heap.texture_slot_checked(5).is_some());
+        // Nothing more is kept.
+        assert_eq!(heap.texture_slots_faulted(21, false), 0);
     }
 
     #[test]
