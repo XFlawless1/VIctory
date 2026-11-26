@@ -30,6 +30,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+#[cfg(feature = "diagnostics")]
+pub(crate) mod seen;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -957,6 +960,93 @@ static PUBLISHED: Bits = Bits::new();
 /// no view.
 static PROTECTED: Bits = Bits::new();
 
+/// The blocks that hold bytes of a texture picked by index that is under a
+/// look ([`texture_look`]): a write fault on a guarded block whose page is
+/// shown there tells the queue of such textures ([`faulted`]). Never
+/// cleared: a block that held one and holds something else now only has a
+/// notice made for nothing, which the pass finds out.
+static TEXTURES: Bits = Bits::new();
+
+/// Whether anything is in [`TEXTURES`].
+static TEXTURES_LOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Since the start: write faults on guarded blocks that hold a texture under
+/// a look, whose slots were told of the write; and ranges of them dropped
+/// because no pass took them.
+pub(crate) static FAULT_NOTICES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether the title's write fault on guarded memory tells the textures
+/// picked by index that lie there (`VICTORY_FAULT_NOTICE=0`: nothing is
+/// told, and their looks at fixed ages are all that finds the change, as
+/// before).
+///
+/// The guards know of every first write to a block a host copy took, and so
+/// of the first write to a texture uploaded from it: the upload's staging
+/// buffer asked for the block with `writes(.., true)`, which made it
+/// read-only, and the title's store faults. But the guards' answer is for
+/// the one who asks, and nothing asked after the upload: the slot's next look
+/// was one of the fixed ages ([`crate::draw`] `RECHECK_FRAMES`: 4, 12, 40, 120
+/// and 400 frames after the one before), so a change was shown up to that
+/// many frames late. 192 of the first 200 changes found by such a look in a
+/// world run were of that kind (run a_cls1), the rest told by a runtime
+/// notice that came with no slot to wake, or by nothing a guard saw.
+fn fault_notice() -> bool {
+    crate::toggled!("VICTORY_FAULT_NOTICE")
+}
+
+/// Textures picked by index at `[at, at + len)`, just uploaded or looked at
+/// and found as they were, are under a look: a write fault in a block of
+/// theirs is told ([`faulted`]). A block of view memory that is not
+/// guarded now (the fault that told of the last write opened it, and a
+/// slot whose upload was not needed took none) is guarded again, so that
+/// the next write faults.
+pub(crate) fn texture_look(at: usize, len: usize) {
+    if len == 0 || !fault_notice() {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    for block in first..last {
+        TEXTURES.set(block);
+    }
+    TEXTURES_LOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // (Not every block known clean by its bit: a fault opens the view it is
+    // at and leaves the others read-only, but not clean.)
+    if !PUBLISHED.all(first, last) && crate::inplace::shown_bytes(at, len).is_some() {
+        let _ = writes(at, at.saturating_add(len), true);
+    }
+}
+
+/// The title wrote to `at`, a guarded block of view memory, and the block was
+/// opened: the textures picked by index that have bytes in the 4 KiB of any
+/// view of that page that was written first are told of it
+/// ([`crate::descriptor::host::faulted`]). Not the whole block: a block holds
+/// the end of one texture and the start of the next, and telling both of a
+/// write to one made a look of 48 KiB for every write of a hot neighbour
+/// (the whole block was tried: 168,000 looks brought forward in four minutes,
+/// and the changes that looks found did not fall, 144 against 91 without it).
+fn faulted(at: usize) {
+    if !TEXTURES_LOOKED.load(std::sync::atomic::Ordering::Relaxed) || !fault_notice() {
+        return;
+    }
+    let (block, within) = (at / BLOCK, at % BLOCK & !(KERNEL_PAGE - 1));
+    let mut views = crate::inplace::pages_of(block * BLOCK);
+    if views.is_empty() {
+        views.push(block * BLOCK);
+    }
+    let mut told = false;
+    for page in views {
+        if TEXTURES.any(page / BLOCK, page / BLOCK + 1) {
+            #[cfg(feature = "diagnostics")]
+            seen::note(seen::Kind::Told, page, BLOCK);
+            crate::descriptor::host::faulted(page + within, KERNEL_PAGE);
+            told = true;
+        }
+    }
+    if told {
+        FAULT_NOTICES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
 /// block is as it was else: read-only, clean, and an asking that finds its
@@ -1530,7 +1620,7 @@ pub(crate) fn landing(at: usize, len: usize) {
             }
         }
     }
-    writing(at, len);
+    writing_as(at, len, true);
 }
 
 
@@ -1591,10 +1681,14 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     for &(at, len) in spans {
+        #[cfg(feature = "diagnostics")]
+        seen::note(seen::Kind::Beside, at, len);
         // A placed texture there changes with no descriptor written.
         crate::descriptor::host::remapped(at, len);
     }
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
+        #[cfg(feature = "diagnostics")]
+        seen::note(seen::Kind::Beside, other, BLOCK);
         crate::descriptor::host::remapped(other, BLOCK);
     }
     (noted, before)
@@ -1837,6 +1931,8 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
         if !covered {
             all = false;
             g.clean.remove(block);
+            #[cfg(feature = "diagnostics")]
+            seen::note_views(seen::Kind::Uncovered, block);
         }
     }
     all
@@ -2038,6 +2134,15 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    writing_as(at, len, false);
+}
+
+/// [`writing`], by the landing of what shaders wrote if `landing` (told
+/// apart in the notes of diagnostics only).
+fn writing_as(at: usize, len: usize, landing: bool) {
+    #[cfg(feature = "diagnostics")]
+    seen::note(if landing { seen::Kind::Landing } else { seen::Kind::Writing }, at, len);
+    let _ = landing;
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2065,6 +2170,8 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    #[cfg(feature = "diagnostics")]
+    seen::note(seen::Kind::Kernel, at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2148,6 +2255,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    seen::note(seen::Kind::PageWritten, at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2527,6 +2636,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    seen::note(seen::Kind::Changed, at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2601,6 +2712,8 @@ pub(crate) fn install() {
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
+            // (Done beside the guard, which stays: told all the same.)
+            faulted(at);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread may have opened the block since this one faulted
@@ -2626,11 +2739,18 @@ pub(crate) fn install() {
                 drop(g);
                 #[cfg(feature = "diagnostics")]
                 {
+                    seen::note_views(seen::Kind::Fault, block);
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
                     let held = (began.elapsed() - waited).as_nanos() as u64;
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                }
+                // A texture picked by index there changed with no descriptor
+                // written: told, so that its slot is looked at in the next
+                // pass, not at one of its fixed ages.
+                if ours.is_none() {
+                    faulted(at);
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
@@ -3437,6 +3557,37 @@ mod tests {
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A texture picked by index is under a look at one view of pages, and
+    /// the title writes them through another: the fault is told
+    /// ([`faulted`]), once per block opened, and the block is guarded again
+    /// by the next look ([`texture_look`]) so that the write after that
+    /// is told as well.
+    #[test]
+    fn a_write_fault_in_a_texture_under_a_look_is_told() {
+        use std::sync::atomic::Ordering::Relaxed;
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let told = || FAULT_NOTICES[0].load(Relaxed);
+        // Under a look: taken in by the guards, as an upload's staging does.
+        assert!(guard(guarded, guarded + SIZE).is_some());
+        texture_look(guarded, SIZE);
+        let before = told();
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(told(), before + 1, "the write through the other view faulted and was told");
+        // Open now: more writes to the block fault no more, are not told.
+        // SAFETY: as above.
+        unsafe { ((other + BLOCK + 16) as *mut u8).write(2) };
+        assert_eq!(told(), before + 1);
+        // The look finds nothing changed in its windows, and guards the
+        // block again: the next write is told.
+        texture_look(guarded, SIZE);
+        // SAFETY: as above.
+        unsafe { ((other + BLOCK + 24) as *mut u8).write(3) };
+        assert_eq!(told(), before + 2);
         drop_views(section, &[guarded, other], SIZE);
     }
 

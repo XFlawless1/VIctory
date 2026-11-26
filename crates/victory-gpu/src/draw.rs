@@ -680,16 +680,20 @@ fn note_look(index: u32, frame: u64, uploaded: u64) -> u64 {
 /// Diagnostics: a look found a change that could have gone unseen for
 /// `frames`; every 25th is told with all so far.
 #[cfg(feature = "diagnostics")]
-fn note_unseen(frames: u64) {
+fn note_unseen(frames: u64, class: &str) {
     let bucket = [4u64, 12, 40, 120, 400].iter().position(|&b| frames <= b).unwrap_or(5);
     UNSEEN[bucket].fetch_add(1, Ordering::Relaxed);
     let all: Vec<u64> = UNSEEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let total: u64 = all.iter().sum();
+    let causes = crate::watch::seen::count(class);
     if total.is_multiple_of(25) {
         tracing::info!(
             total,
             "texture changes found by a look, by how many frames they could have gone unseen (up to 4, 12, 40, 120, 400, more): {all:?}"
         );
+        for (class, n) in causes.iter().take(14) {
+            tracing::info!("texture changes found by a look, by what the guards and notices knew: {n} x {class}");
+        }
     }
 }
 
@@ -2270,6 +2274,9 @@ impl State {
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
         let baking = crate::texture::BAKING.get();
+        // Slots of uploaded textures the title wrote to through a view,
+        // which the guards caught (`crate::watch::faulted`).
+        host.texture_slots_faulted(frame, baking);
         if baking {
             // The pass before a draw of the bake also takes the slots under
             // bytes written since a pass last looked, which a pass leaves
@@ -2358,6 +2365,10 @@ impl State {
                 served = false;
                 break;
             }
+            // Diagnostics: what is told of this slot's memory from here on
+            // counts as told after its upload.
+            #[cfg(feature = "diagnostics")]
+            let seq0 = crate::watch::seen::seq();
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2409,7 +2420,9 @@ impl State {
                 }
                 let times = found_changed(index);
                 #[cfg(feature = "diagnostics")]
-                note_unseen(unseen_for);
+                let cause = crate::watch::seen::cause(index, at as usize, len as usize, frame);
+                #[cfg(feature = "diagnostics")]
+                note_unseen(unseen_for, &cause.class);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2419,6 +2432,10 @@ impl State {
                         View::Placed(false, _, desc) => crate::resource::first_mip(&desc),
                         _ => 0,
                     });
+                    #[cfg(feature = "diagnostics")]
+                    let (class, detail) = (cause.class.as_str(), cause.detail.as_str());
+                    #[cfg(not(feature = "diagnostics"))]
+                    let (class, detail) = ("", "");
                     tracing::warn!(
                         first_level = first,
                         blocks_shown_elsewhere = elsewhere.len(),
@@ -2429,6 +2446,8 @@ impl State {
                         looks,
                         slot_changes = times,
                         changed = n + 1,
+                        class,
+                        detail,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
@@ -2576,6 +2595,8 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::watch::seen::uploaded(index, seq0, at as usize, len as usize, frame, None);
                         let print = crate::texture::fingerprint(at, len);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
@@ -2675,6 +2696,8 @@ impl State {
             } else {
                 None
             };
+            #[cfg(feature = "diagnostics")]
+            let asked = if crate::watch::seen::on() { crate::texture::staged_asked(resource) } else { None };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
@@ -2687,6 +2710,8 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::watch::seen::uploaded(index, seq0, at as usize, len as usize, frame, asked);
                     let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }

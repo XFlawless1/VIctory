@@ -8693,15 +8693,27 @@ impl Meter {
                     [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
                 let [waits, jobs, waited_us, at_limit] =
                     [0, 1, 2, 3].map(|i| crate::draw::BAKE_DRAINS[i].load(Ordering::Relaxed));
+                let [told, dropped] = [0, 1].map(|i| crate::watch::FAULT_NOTICES[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "looks at uploaded textures picked by index, since the start: {unchanged} found the memory as it was, {changed} \
-                     found it changed and uploaded it again; draws of the title's bake (VICTORY_BAKE_EXACT=0: as before): {} slots \
+                     found it changed and uploaded it again; {told} write faults of the title's on guarded blocks of such textures \
+                     told their slots ({} made due, {dropped} ranges dropped; VICTORY_FAULT_NOTICE=0: not told, as before); draws of \
+                     the title's bake (VICTORY_BAKE_EXACT=0: as before): {} slots \
                      of uploaded textures made due at once by bytes written under them, {waits} waits for uploads ahead of the lists \
                      ({jobs} uploads, {:.1} ms in all, {at_limit} ended at the limit)",
+                    crate::descriptor::host::FAULTED_SLOTS.load(Ordering::Relaxed),
                     crate::descriptor::host::BAKE_WOKEN.load(Ordering::Relaxed),
                     waited_us as f64 / 1e3
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                "passes over the textures picked by index that took notes of write faults, by the frames since the first write \
+                 they hold (0, 1, 2, 3 or more): {:?}; ranges taken, slots under them, slots whose look was brought forward, \
+                 slots made due again: {:?}",
+                [0, 1, 2, 3].map(|i| crate::descriptor::host::FAULT_LAG[i].load(Ordering::Relaxed)),
+                [0, 1, 2, 3].map(|i| crate::descriptor::host::FAULT_STEPS[i].load(Ordering::Relaxed))
+            );
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",

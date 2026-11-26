@@ -1521,6 +1521,36 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// Diagnostics: the parts of [`fingerprint`], one hash for each window it
+/// reads (the whole of a memory of up to 48 KiB is the first; 0 for the
+/// others), to tell which of them a change reached.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fingerprint_parts(at: u64, len: u64) -> [u64; 3] {
+    const WINDOW: usize = 16 << 10;
+    let len = len as usize;
+    let take = |from: usize, bytes: usize| {
+        let mut read = vec![0u8; bytes];
+        crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+        digest(&read).0 as u64
+    };
+    if len <= 3 * WINDOW {
+        [take(0, len), 0, 0]
+    } else {
+        [take(0, WINDOW), take((len / 2) & !0xfff, WINDOW), take(len - WINDOW, WINDOW)]
+    }
+}
+
+/// Diagnostics: the write-watch asking the staging buffer of `resource` was
+/// filled after (0: none, or the buffer is being filled).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staged_asked(resource: This) -> Option<u64> {
+    let staging = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    staging.last.try_lock().ok().map(|last| last.asked)
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
