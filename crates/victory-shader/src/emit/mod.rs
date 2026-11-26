@@ -510,8 +510,9 @@ pub fn emit(
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // has no barrier, stays on. Two lighting programs are on by default
+        // ([`wide_wanted`]): without it they were translated in the approximate form.
+        let wide_on = wide_wanted(std::env::var("VICTORY_WAVE_WIDE").ok().as_deref(), c);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -626,6 +627,27 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Programs of the title that take the wave-wide form of a wave64 program ([`widen`]) without
+/// `VICTORY_WAVE_WIDE=1`: each was translated only in the approximate form of local waves
+/// (`lower::with_local_waves_any`: each host wave giving its own half of a console wave's
+/// result) before. Both have a thread group of one console wave (64 lanes), which `widen`
+/// needs.
+/// - `CS_GenerateShadowMasks_HairOnly`: the shadow masks of hair, per 8x8 tile.
+/// - `CS_ClusterLightsWorldSpace`: which lights reach each cluster of the world.
+const WIDE_BY_DEFAULT: [&[u8]; 2] = [b"CS_GenerateShadowMasks_HairOnly", b"CS_ClusterLightsWorldSpace"];
+
+/// Whether the wave-wide form of a wave64 program is tried for `c`: `setting` is
+/// `VICTORY_WAVE_WIDE` (`1`: every program, `0`: none; unset: [`WIDE_BY_DEFAULT`]'s).
+fn wide_wanted(setting: Option<&str>, c: &Container) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => {
+            c.parts.iter().any(|p| WIDE_BY_DEFAULT.iter().any(|name| p.data.windows(name.len()).any(|w| w == *name)))
+        }
+    }
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -958,6 +980,33 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A container of one part holding `bytes`.
+    fn container_of(bytes: &[u8]) -> crate::dxbc::Container<'_> {
+        crate::dxbc::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![crate::dxbc::Part { fourcc: crate::dxbc::FourCC::DXIL, offset: 0, data: bytes }],
+        }
+    }
+
+    #[test]
+    fn two_lighting_programs_take_the_wave_wide_form_by_default() {
+        use super::wide_wanted;
+        let hair = container_of(b"..CS_GenerateShadowMasks_HairOnly_13d14336_Wrapped..");
+        let clusters = container_of(b"CS_ClusterLightsWorldSpace_07a2af12");
+        let other = container_of(b"ptfx_CS_lightAtlas_Sprite_00000000");
+        // unset: only the two named
+        assert!(wide_wanted(None, &hair));
+        assert!(wide_wanted(None, &clusters));
+        assert!(!wide_wanted(None, &other));
+        // `1`: every program, `0`: none (the old behaviour), anything else as unset
+        assert!(wide_wanted(Some("1"), &other));
+        assert!(!wide_wanted(Some("0"), &hair));
+        assert!(!wide_wanted(Some("0"), &clusters));
+        assert!(wide_wanted(Some(""), &hair));
+        assert!(!wide_wanted(Some(""), &other));
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
