@@ -87,6 +87,8 @@ impl Threads {
 /// Names of addresses.
 pub(super) struct Names {
     known: HashMap<usize, String>,
+    /// [`Names::leaf`]'s, apart: it names the system's functions too.
+    leaves: HashMap<usize, String>,
     symbols: Option<Symbols>,
 }
 
@@ -154,8 +156,28 @@ impl Names {
     pub(super) fn new() -> Names {
         Names {
             known: HashMap::new(),
+            leaves: HashMap::new(),
             symbols: Symbols::load(),
         }
+    }
+
+    /// A name for the instruction a sample found a thread at: ours by their
+    /// names, the system's by the exported name nearest below (`ntdll!`
+    /// `ZwWaitForAlertByThreadId` is a thread parked), else by module and
+    /// place.
+    fn leaf(&mut self, address: usize) -> String {
+        if let Some(name) = self.leaves.get(&address) {
+            return name.clone();
+        }
+        let (file, at, ours) = Self::module(address);
+        let module = file.strip_suffix(".dll").unwrap_or(&file).to_string();
+        let name = match self.symbols.as_ref().and_then(|s| s.name(address + 1)) {
+            Some(name) if ours => name,
+            Some(name) => format!("{module}!{name}"),
+            None => format!("{module}+{at:#x}"),
+        };
+        self.leaves.insert(address, name.clone());
+        name
     }
 
     /// The module `address` lies in, and where in it; whether it is ours.
@@ -656,6 +678,62 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
     let _ = writeln!(text, "\nlist calls of 50 us or more, per frame");
     for (site, (sum, n)) in calls.into_iter().take(25) {
         let _ = writeln!(text, "  {:7.2} ms in {:7.1}  {site}", ms(sum) / frames, n as f64 / frames);
+    }
+    text.push_str(&profile(trace, names, stacks, frames, &label));
+    text
+}
+
+/// The samples of the title's submitting threads ([`Kind::Sample`]): a
+/// quarter of a millisecond apart, each an instruction and what lay near it
+/// on the stack. By thread: where the instruction was (the thread's own
+/// time, a parked thread under the system's waiting function), which of our
+/// functions had called it (the first not the library's), and the two
+/// together for the system's. Milliseconds of a frame are the share of the
+/// thread's samples times the frame.
+fn profile(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]], frames: f64, label: &dyn Fn(u32) -> String) -> String {
+    let mut by_thread: BTreeMap<u32, Vec<&Event>> = BTreeMap::new();
+    for e in trace.events.iter().filter(|e| e.kind == Kind::Sample) {
+        by_thread.entry(e.thread).or_default().push(e);
+    }
+    let mut text = String::new();
+    let (Some((&(start, _), &(stop, _))), true) = (trace.frames.first().zip(trace.frames.last()), !by_thread.is_empty()) else {
+        return text;
+    };
+    let frame_ms = ms(stop - start) / frames;
+    for (thread, samples) in by_thread {
+        let total = samples.len() as f64;
+        let mut leaves: HashMap<String, usize> = HashMap::new();
+        let mut callers: HashMap<String, usize> = HashMap::new();
+        let mut both: HashMap<String, usize> = HashMap::new();
+        for e in &samples {
+            let leaf = names.leaf(e.a as usize);
+            let site = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(String::new(), |s| names.site(s));
+            let caller: String = site.split(" < ").take(2).collect::<Vec<_>>().join(" < ");
+            *leaves.entry(leaf.clone()).or_default() += 1;
+            *callers.entry(caller.clone()).or_default() += 1;
+            // Only where the thread was in the system's code: the rest says it alone.
+            if !leaf.starts_with("victory") {
+                *both.entry(format!("{leaf} | {caller}")).or_default() += 1;
+            }
+        }
+        for (title, table) in [
+            ("where the instruction was", leaves),
+            ("which of our functions it was under (the two innermost not of the library's)", callers),
+            ("in the system's code or elsewhere, and under what", both),
+        ] {
+            let mut rows: Vec<(String, usize)> = table.into_iter().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+            let _ = writeln!(
+                text,
+                "\nsamples of {} ({} of them, a frame is {:.1} ms): {title}",
+                label(thread),
+                samples.len(),
+                frame_ms
+            );
+            for (name, n) in rows.into_iter().take(45) {
+                let _ = writeln!(text, "  {:5.1} %  {:6.2} ms  {name}", n as f64 * 100.0 / total, n as f64 / total * frame_ms);
+            }
+        }
     }
     text
 }

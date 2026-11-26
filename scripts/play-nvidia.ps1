@@ -38,6 +38,12 @@ $settings = @{
     VICTORY_BVH_MISS = '1'
     # Memory compares on the card instead of the CPU: 11 -> about 22 fps on Series S.
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
+    # ... and the small buffers too (64 KiB is every title buffer): the title's compute passes keep their atomic counters, work
+    # lists and outputs in buffers of 88 bytes to 1 MiB, which stayed in the PC's memory below the 1 MiB limit, so the card read
+    # and wrote them over the bus. Measured on an RTX 5080 in the prison cell, the card's time for the same commands went from
+    # 36.8 to 17.3 ms a frame and the frame from 51.8 / 50.5 ms (two runs) to 40.8 / 42.0 / 42.9 ms (three). `-More
+    # @{VICTORY_CARD_BUFFERS_MIN_KB='0'}` brings back the 1 MiB limit. Costs about 260 MB more of the card's memory.
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }

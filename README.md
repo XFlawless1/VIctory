@@ -108,6 +108,19 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
    memory to find what the title had changed. These move the compares of copies
    of 1 MiB or more to the graphics card. Copying back fell from about 27 to
    10 ms a frame, and the frame rate doubled (11 to 21.8 fps).
+
+   **Small buffers too** (`VICTORY_CARD_BUFFERS_MIN_KB=64`; `=0` goes back to
+   the 1 MiB limit). Below 1 MiB a title buffer's copy stayed in the PC's
+   memory, and the card read and wrote it over the bus. The title's compute
+   passes keep their atomic counters, work lists and outputs in exactly such
+   buffers (88 bytes to 1 MiB): on an RTX 5080 in the prison cell the card's
+   time for the same 2,940 dispatches and 4,640 indirect draws went from
+   36.8 to 17.3 ms a frame (one dispatch, `CS_Primary_RegisterAllocationRequests`,
+   from 5.3 ms to under 0.2), and the frame from 51.8 and 50.5 ms (two runs)
+   to 40.8, 42.0 and 42.9 ms (three runs); the card is half idle after it, the
+   preparing thread is the limit now. It costs about 260 MB more of the card's
+   memory (3,700 copies, 996 MB, against 83 copies, 737 MB) and about 2 ms a
+   frame of copies on the preparing thread.
 6. **Wait for new shaders** (`VICTORY_PIPELINE_WAIT_MS=10000`). Draws wait for
    a pipeline still being made instead of being skipped: nothing is missing,
    with a short hitch the first time a place is seen.
