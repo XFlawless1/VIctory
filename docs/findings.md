@@ -85,8 +85,11 @@ in that order of size:
    for the next submission while this one is sent; view the card's own buffers where fills
    copy them now.
 2. The card: small buffers' copies in its own memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`,
-   after fxceless c36971b2; not measured here yet), and the passes that run for nothing
-   without rays.
+   after fxceless c36971b2). Measured on an RTX 5080 in the prison cell (the NVIDIA fork's
+   branch, not this card): the card's time for the same commands 36.8 -> 17.3 ms a frame,
+   the frame 51.8 / 50.5 -> 40.8 / 42.0 ms; the title's counters, work lists and outputs
+   live in buffers of 88 bytes to 1 MiB, and the card read them over the bus. And the
+   passes that run for nothing without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
    pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's

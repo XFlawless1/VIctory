@@ -4476,16 +4476,20 @@ fn describe(view: Option<&View>) -> String {
             format!("{}x{} f{} flags {:#x} of {r:?}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
+    // Where the copy of a buffer range's memory lives (card, pc, in place).
+    let lives = |range: Option<(u64, u64)>| range.map_or(String::new(), |(at, _)| format!(" on {}", crate::shadow::placement(at)));
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
+            let range = crate::descriptor::host::buffer_range(v);
+            format!("buffer {range:?}{}", lives(range))
+        }),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
-            None => format!(
-                "uav resource {r:#x} buffer {:?}",
-                crate::descriptor::host::buffer_range(v)
-            ),
+            None => {
+                let range = crate::descriptor::host::buffer_range(v);
+                format!("uav resource {r:#x} buffer {range:?}{}", lives(range))
+            }
         },
         Some(View::Placed(u, r, d)) => {
             let (width, at) = (u64::from(r[4]) | u64::from(r[5]) << 32, u64::from(d[10]) | u64::from(d[11]) << 32);
@@ -4495,8 +4499,9 @@ fn describe(view: Option<&View>) -> String {
                 .then(|| trace_dwords(at, width as usize))
                 .flatten()
                 .unwrap_or_default();
+            let on = if r[0] == 1 { lives(Some((at, 0))) } else { String::new() };
             format!(
-                "placed uav={u} dim {} {}x{} f{} layout {:#x} at {at:#x}{all}",
+                "placed uav={u} dim {} {}x{} f{} layout {:#x} at {at:#x}{all}{on}",
                 r[0], width, r[6], r[8], r[11]
             )
         }
@@ -4511,7 +4516,7 @@ fn describe(view: Option<&View>) -> String {
                 .then(|| trace_dwords(*address, (*size as usize).min(4096)))
                 .flatten()
                 .unwrap_or_default();
-            format!("Constant({address:#x}, {size}) {v:?}{all}")
+            format!("Constant({address:#x}, {size}) {v:?}{all}{}", lives(Some((*address, 0))))
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }

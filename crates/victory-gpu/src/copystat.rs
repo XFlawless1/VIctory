@@ -225,7 +225,7 @@ pub(crate) fn command_took(op: &str, ms: f64) {
         let mut longest = LONGEST_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
         let e = longest.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((0, String::new()));
         if us > e.0 {
-            *e = (us, op.chars().take(1500).collect());
+            *e = (us, op.chars().take(4000).collect());
         }
     }
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1358,7 +1358,7 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
         // What the heaviest bind: the whole note of the longest one (since the start).
-        if i < 8
+        if i < 16
             && let Some((_, note)) = notes.as_ref().and_then(|m| m.get(&what))
         {
             tracing::info!("    its longest one: {note}");

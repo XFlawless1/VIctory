@@ -207,6 +207,25 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// The least size of a card copy after `VICTORY_CARD_BUFFERS_MIN_KB`: that
+/// many KiB when it is set and not 0, else `min_bytes` as the MiB setting and
+/// the budget gave it.
+///
+/// Measured on an RTX 5080 in the prison cell (`VICTORY_GPU_TIMING`, the same
+/// 2,940 dispatches and 4,640 indirect draws a frame): with 64 here the card's
+/// time went from 36.8 to 17.3 ms a frame (dispatches 20.9 to 6.5 ms, indirect
+/// draws 12.6 to 7.9). The title's compute passes keep their counters, work
+/// lists and outputs in small buffers (88 bytes to 1 MiB): at the 1 MiB limit
+/// all of those stayed in the PC's memory, and the wave's atomic of
+/// `CS_Primary_RegisterAllocationRequests` alone cost 5.3 ms a frame over the
+/// bus.
+fn min_with_kib(min_bytes: u64, kib: Option<u64>) -> u64 {
+    match kib {
+        Some(kib) if kib > 0 => kib.saturating_mul(1 << 10),
+        _ => min_bytes,
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -229,11 +248,12 @@ fn card_limits() -> (u64, u64) {
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
-            min_bytes = kib << 10;
-        }
+        // (`VICTORY_CARD_BUFFERS_MIN_KB=0` leaves the MiB setting in force:
+        // the way back to the old limit.)
+        min_bytes = min_with_kib(
+            min_bytes,
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()),
+        );
         if card_all() {
             min_bytes = 0;
         }
@@ -4833,6 +4853,42 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// Where the copy shaders see for title memory at `address` lives, in a few
+/// words, without making one (diagnostics, the frame listing and the
+/// `VICTORY_GPU_TIMING` notes: whether a dispatch's buffers are read in the
+/// card's own memory or across the bus). `card`: the card's memory; `pc`: a
+/// buffer in the PC's memory (the card reads and writes it over PCIe);
+/// `in place`: the title's own memory; each with the copy's size.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn placement(address: u64) -> String {
+    let kind = |s: &Shadow, window: bool| {
+        let place = if s.in_place() {
+            "in place"
+        } else if s.carded() {
+            "card"
+        } else if s.mapped {
+            "card-mapped"
+        } else {
+            "pc"
+        };
+        format!("{}{place} {}K", if window { "window " } else { "" }, s.len >> 10)
+    };
+    {
+        let map = buffers_read();
+        if let Some((_, e)) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end > address) {
+            return match &e.shadow {
+                Some(s) => kind(s, false),
+                None => "buffer without a copy".to_owned(),
+            };
+        }
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    match loose.range(..=(address, u64::MAX)).rev().take(64).find(|((start, len), _)| start + len > address) {
+        Some((_, s)) => kind(s, true),
+        None => "no copy".to_owned(),
+    }
+}
+
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
@@ -5420,8 +5476,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, min_with_kib,
+        resolve_card_limits, tail_of, window_of,
     };
 
     #[test]
@@ -5452,6 +5508,19 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB`: a number of KiB sets the least size of a
+    /// card copy, 0 and anything unreadable leave the MiB setting alone (the
+    /// way back to the 1 MiB limit the launcher used before it asked for 64).
+    #[test]
+    fn the_least_card_copy_follows_kib_unless_it_is_zero() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(min_with_kib(MIB, Some(64)), 64 << 10);
+        assert_eq!(min_with_kib(4 * MIB, Some(1024)), MIB);
+        assert_eq!(min_with_kib(MIB, Some(0)), MIB);
+        assert_eq!(min_with_kib(MIB, None), MIB);
+        assert_eq!(min_with_kib(MIB, Some(u64::MAX)), u64::MAX);
     }
 
     /// An ask that may take any window takes the longest that holds all of

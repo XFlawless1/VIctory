@@ -6189,7 +6189,7 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(4000).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
