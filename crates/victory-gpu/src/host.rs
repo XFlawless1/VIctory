@@ -3343,6 +3343,70 @@ struct RelayFetch {
     had: crate::land::Had,
 }
 
+/// How long the relay looks at the fence for the next flight before it waits
+/// for the card's event: `VICTORY_RELAY_SPIN_US` microseconds (default 0: not
+/// at all, as always; with `VICTORY_AB=<s>,VICTORY_RELAY_SPIN` the looking is
+/// on and off while the title runs).
+///
+/// Measured (RTX 5080, a world frame, 400 microseconds, 12 s phases of one
+/// run, four each way): median 50.25 ms with it against 50.5 without, inside
+/// the spread of the phases (48 to 53); so it stays off.
+fn relay_spin_us() -> u64 {
+    static US: OnceLock<u64> = OnceLock::new();
+    let us = *US.get_or_init(|| std::env::var("VICTORY_RELAY_SPIN_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if crate::toggled!("VICTORY_RELAY_SPIN") { us } else { 0 }
+}
+
+/// Looks until `done` or [`relay_spin_us`] have passed: whether it was done.
+fn relay_spin(done: impl Fn() -> bool) -> bool {
+    spin_for(relay_spin_us(), done)
+}
+
+/// Looks until `done` or `us` microseconds have passed (0: not at all):
+/// whether it was done.
+fn spin_for(us: u64, done: impl Fn() -> bool) -> bool {
+    if us == 0 {
+        return false;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_micros(us);
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        for _ in 0..8 {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_spin_tests {
+    use super::spin_for;
+
+    #[test]
+    fn looking_for_a_while_says_whether_what_is_waited_for_was_seen() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        // Not at all: not seen, and no time spent.
+        assert!(!spin_for(0, || true));
+        // Already there: seen at once.
+        assert!(spin_for(400, || true));
+        // Never there: gives up after the time, not before it.
+        let began = std::time::Instant::now();
+        assert!(!spin_for(400, || false));
+        assert!(began.elapsed() >= std::time::Duration::from_micros(300));
+        // Comes while it looks: seen (a long time is given: a slow machine may start the other thread late).
+        let flag = AtomicBool::new(false);
+        let seen = std::thread::scope(|s| {
+            s.spawn(|| flag.store(true, Relaxed));
+            spin_for(2_000_000, || flag.load(Relaxed))
+        });
+        assert!(seen);
+    }
+}
+
 /// The thread that lands flights ([`relay`]): as soon as the card has run
 /// the first flights of the line it takes them, with what follows them,
 /// and does what they left to do ([`Host::relay_land`]); else it waits for
@@ -3403,14 +3467,22 @@ fn relay_worker() {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                // The fence's value is written by the card and read here
+                // without a call to the system: a flight that ends soon is
+                // seen at once, not after the card's interrupt, the kernel's
+                // call-back and the wake-up of this thread.
+                // SAFETY: a plain query.
+                let seen = relay_spin(|| unsafe { host.fence.GetCompletedValue() } >= target);
+                if !seen {
+                    // SAFETY: the host's fence and this thread's event.
+                    let waited = unsafe {
+                        host.fence.SetEventOnCompletion(target, event).map(|()| {
+                            WaitForSingleObject(event, INFINITE);
+                        })
+                    };
+                    if waited.is_err() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -3629,6 +3701,8 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+#[cfg(feature = "diagnostics")]
+mod probe;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -5405,6 +5479,8 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        probe::burn_cpu();
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -8466,13 +8542,65 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// The swap chain's buffers when the depth is not asked for (the old way).
 const BUFFERS: u32 = 2;
+
+/// How many buffers the swap chain has: [`BUFFERS`] (two), or what
+/// `VICTORY_PRESENT_BUFFERS=<2..=8>` asks for (`VICTORY_DEEP_PRESENT=0` makes
+/// it two again, and with `VICTORY_AB=<s>,VICTORY_DEEP_PRESENT` the buffers are
+/// made again at a present while the title runs).
+///
+/// Measured, in a world frame (RTX 5080, 20 fps, 12 s phases of one run, four
+/// each way): three buffers instead of two changed nothing that shows over the
+/// phases' spread of about 1 ms (median 50.9 against 51.7), and the host's
+/// `Present` blocked 8 to 11 ms a frame with either. So that wait is not for a
+/// buffer; it stays two, as before.
+fn present_buffers() -> u32 {
+    static SETTING: OnceLock<Option<String>> = OnceLock::new();
+    let setting = SETTING.get_or_init(|| std::env::var("VICTORY_PRESENT_BUFFERS").ok());
+    buffers_for(setting.as_deref(), crate::toggled!("VICTORY_DEEP_PRESENT"))
+}
+
+/// The buffers of the swap chain: what `setting` (`VICTORY_PRESENT_BUFFERS`)
+/// asks for, from 2 to 8, unless `deep` is off, or it says nothing usable:
+/// [`BUFFERS`].
+fn buffers_for(setting: Option<&str>, deep: bool) -> u32 {
+    if !deep {
+        return BUFFERS;
+    }
+    setting.and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (2..=8).contains(n)).unwrap_or(BUFFERS)
+}
+
+#[cfg(test)]
+mod present_buffers_tests {
+    use super::{BUFFERS, buffers_for};
+
+    #[test]
+    fn the_swap_chain_has_two_buffers_unless_asked_for_more() {
+        assert_eq!(buffers_for(None, true), BUFFERS);
+        assert_eq!(buffers_for(None, false), BUFFERS);
+        assert_eq!(buffers_for(Some("4"), true), 4);
+        assert_eq!(buffers_for(Some(" 5 "), true), 5);
+        // Switched off, a number does not matter; out of range or not a number: two.
+        assert_eq!(buffers_for(Some("4"), false), BUFFERS);
+        assert_eq!(buffers_for(Some("1"), true), BUFFERS);
+        assert_eq!(buffers_for(Some("9"), true), BUFFERS);
+        assert_eq!(buffers_for(Some("many"), true), BUFFERS);
+        assert_eq!(buffers_for(Some("3"), true), 3);
+    }
+}
+
+/// Microseconds the host's `Present` call blocked, since the last frame-rate
+/// line.
+static PRESENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    /// The swap chain's buffers ([`present_buffers`]).
+    buffers: u32,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -8549,6 +8677,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let present_ms = PRESENT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -8728,6 +8857,11 @@ impl Meter {
                 );
             }
             tracing::info!(
+                "the host's Present call blocked {present_ms:.1} ms per frame (a swap chain of {} buffers: VICTORY_PRESENT_BUFFERS=<n>, \
+                 VICTORY_DEEP_PRESENT=0 makes it two)",
+                present_buffers()
+            );
+            tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
@@ -8849,23 +8983,25 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
+        let buffers = present_buffers();
+        if (p.width, p.height, p.format, p.buffers) != (width, height, format, buffers) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(buffers, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
-                    (p.width, p.height, p.format) = (width, height, format);
+                    (p.width, p.height, p.format, p.buffers) = (width, height, format, buffers);
                     tracing::info!(
                         width,
                         height,
                         format = format.0,
+                        buffers,
                         frame,
-                        "the swap chain's buffers were made again for another size or format"
+                        "the swap chain's buffers were made again for another size, format or number of buffers"
                     );
                     self.log_video_memory("right after the swap chain's buffers were made again");
                 }
@@ -8922,6 +9058,10 @@ impl Host {
             }
             list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
+            for _ in 0..probe::gpu_copies() {
+                list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
+            }
+            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
@@ -8966,7 +9106,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            let presenting = std::time::Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            PRESENT_US.fetch_add(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -8993,6 +9135,7 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let buffers = present_buffers();
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9002,7 +9145,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: buffers,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
@@ -9018,6 +9161,7 @@ impl Host {
                 width,
                 height,
                 format,
+                buffers,
                 copy,
                 ahead: Vec::new(),
                 hwnd,

@@ -222,6 +222,7 @@ pub(crate) fn called(took: std::time::Duration) {
     if !on() {
         return;
     }
+    title_thread();
     let inside = (took.as_nanos() as u64).saturating_mul(frequency()) / 1_000_000_000;
     let t1 = ticks();
     let t0 = t1 - inside;
@@ -332,7 +333,8 @@ pub(crate) fn polled(at: usize, value: u64) {
 }
 
 /// Threads of the title's that submit or present.
-static TITLES: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// (The threads that record list calls are sampled too: [`called`].)
+static TITLES: [AtomicU32; 12] = [const { AtomicU32::new(0) }; 12];
 
 /// This thread is one of the title's that submit: what it does is sampled.
 #[inline(always)]
