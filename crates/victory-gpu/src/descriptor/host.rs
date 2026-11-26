@@ -1621,6 +1621,14 @@ impl HostHeap {
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
+        // Sampler heaps always back the full 2,048 hardware limit, every slot
+        // past the title's own a plain point sampler, so `umin(index, 2047)` in
+        // `victory-shader` never reads past a smaller title sampler heap.
+        // (This tree: a title heap of 2,048 keeps its slot 2,047. The change as
+        // it came reserved that slot as a null sentinel, which takes it from a
+        // title that uses it and helps nowhere: below 2,048 every slot past the
+        // title's is null anyway.)
+        const SAMPLERS: u32 = 2048;
         if !sampler {
             probe_view_limit();
         }
@@ -1631,7 +1639,16 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler {
+            let fitted = count.min(SAMPLERS);
+            match make(SAMPLERS) {
+                Ok(heap) => (heap, fitted, SAMPLERS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -4937,6 +4954,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every host sampler heap backs all 2,048 hardware descriptors, so
+    /// `umin(index, 2047)` in `victory-shader` never reads past a smaller
+    /// title sampler heap; a title heap of 2,048 keeps all its slots.
+    #[test]
+    fn sampler_heaps_back_2048_slots() {
+        let Some(small) = HostHeap::new(true, 16) else { return };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(small.count, 16);
+        let Some(full) = HostHeap::new(true, 2048) else { return };
+        // SAFETY: live heap query.
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
+        assert_eq!(full.count, 2048);
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
