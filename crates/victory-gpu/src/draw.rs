@@ -623,6 +623,71 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// The longest wait, in frames, between looks at a texture picked by index
+/// that looks found changed at least twice: one the title keeps rewriting
+/// (25 of the 47 textures found changed in a five-minute world run changed
+/// more than once). Its looks went on backing off ([`RECHECK_FRAMES`]: up
+/// to 400 frames, then none), and each change showed only at the next look:
+/// up to 20 seconds late, when the next change came (`VICTORY_RECHECK_DYNAMIC`
+/// is the wait; 0: the plain schedule, as before).
+fn dynamic_look() -> u64 {
+    static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| std::env::var("VICTORY_RECHECK_DYNAMIC").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(24))
+}
+
+/// How many times a look found each slot's texture changed since the start.
+static FOUND_CHANGED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u8>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Diagnostics: the frame of each slot's last look.
+#[cfg(feature = "diagnostics")]
+static LAST_LOOK: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Diagnostics: changes found, by how many frames they could have gone
+/// unseen (since the slot's look before): up to 4, 12, 40, 120, 400, more.
+#[cfg(feature = "diagnostics")]
+static UNSEEN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Diagnostics: slot `index` is looked at in `frame` (its upload was in
+/// `uploaded`): how many frames since its look before.
+#[cfg(feature = "diagnostics")]
+fn note_look(index: u32, frame: u64, uploaded: u64) -> u64 {
+    let before = LAST_LOOK.lock().unwrap_or_else(|e| e.into_inner()).insert(index, frame);
+    frame.saturating_sub(before.unwrap_or(uploaded).max(uploaded))
+}
+
+/// Diagnostics: a look found a change that could have gone unseen for
+/// `frames`; every 25th is told with all so far.
+#[cfg(feature = "diagnostics")]
+fn note_unseen(frames: u64) {
+    let bucket = [4u64, 12, 40, 120, 400].iter().position(|&b| frames <= b).unwrap_or(5);
+    UNSEEN[bucket].fetch_add(1, Ordering::Relaxed);
+    let all: Vec<u64> = UNSEEN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let total: u64 = all.iter().sum();
+    if total.is_multiple_of(25) {
+        tracing::info!(
+            total,
+            "texture changes found by a look, by how many frames they could have gone unseen (up to 4, 12, 40, 120, 400, more): {all:?}"
+        );
+    }
+}
+
+/// A look found slot `index`'s texture changed: how many times so far.
+fn found_changed(index: u32) -> u8 {
+    let mut found = FOUND_CHANGED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = found.entry(index).or_insert(0);
+    *n = n.saturating_add(1);
+    *n
+}
+
+/// Whether slot `index`'s texture is one the title keeps rewriting
+/// ([`dynamic_look`]).
+fn is_dynamic(index: u32) -> bool {
+    dynamic_look() > 0
+        && FOUND_CHANGED.lock().unwrap_or_else(|e| e.into_inner()).get(&index).is_some_and(|&n| n >= 2)
+}
+
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
@@ -2267,11 +2332,21 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                #[cfg(feature = "diagnostics")]
+                let unseen_for = note_look(index, frame, uploaded);
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    // A texture the title keeps rewriting is looked at at
+                    // least every `dynamic_look` frames, and for good
+                    // ([`dynamic_look`]).
+                    let dynamic = is_dynamic(index);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
+                            let wait = if dynamic { (*wait).min(dynamic_look()) } else { *wait };
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                        }
+                        None if dynamic => {
+                            host.texture_slot_recheck(index, write, frame + dynamic_look(), (at, len), print, looks, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
@@ -2280,6 +2355,9 @@ impl State {
                 if recheck_soon() {
                     again_in = 1;
                 }
+                let times = found_changed(index);
+                #[cfg(feature = "diagnostics")]
+                note_unseen(unseen_for);
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
@@ -2297,6 +2375,7 @@ impl State {
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
+                        slot_changes = times,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
