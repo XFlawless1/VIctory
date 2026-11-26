@@ -26,7 +26,15 @@ pub mod structure;
 /// translated before is kept across the rebuild. `victory shaders`
 /// translates again what an earlier build of the translator cached and says
 /// how many came out different: if any did, the bump was due.
-pub const TRANSLATOR_VERSION: u32 = 1;
+///
+/// History: 1 = this key's first (the build of 520776a0, tiled cascade shadows exact on 32-lane
+/// hosts); 2 = the stricter proof of which vector values are the same in every lane of a console
+/// wave (`lower::lane_uniform`, from the Belobug fork): five programs of the title's pack
+/// translate differently (`deferred_tiled:CS_DepthProcessingHBO`,
+/// `indirect_light_probes:CS_Primary_RegisterAllocationRequests`,
+/// `tiled_lighting:CS_ClusterLightsWorldSpace` and `...IntensityBased`,
+/// `water_interaction_foam:CS_DisturbersContribution`) on a host of 32-lane waves.
+pub const TRANSLATOR_VERSION: u32 = 2;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
