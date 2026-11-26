@@ -352,6 +352,10 @@ struct Lower<'a> {
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
+    /// With `exchange`: the results of the first-lane reads whose source every lane in EXEC
+    /// holds alike ([`super::wave_alike`]): where not every lane runs, a host wave's own first
+    /// live lane is the console's.
+    wave_alike: HashSet<Value>,
     /// The console lane (0..63) of this thread, made in the entry block.
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
@@ -1686,6 +1690,12 @@ impl<'a> Lower<'a> {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
                 }
                 _ => Default::default(),
+            },
+            wave_alike: match &exchange {
+                Some((_, false, _)) if !LOCAL_WAVES.get() && super::wave_alike::on() => {
+                    super::wave_alike::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
+                }
+                _ => HashSet::new(),
             },
             exchange,
             clane: None,
@@ -8795,6 +8805,11 @@ impl<'a> Lower<'a> {
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
+                        // exact: every lane in EXEC here holds the same value ([`super::wave_alike`]),
+                        // so this host wave's own first live lane holds the console's
+                        if inst.writes.first().is_some_and(|w| self.wave_alike.contains(&w.1)) {
+                            return int(self, mine);
+                        }
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
                         // the console wave (the ray-tracing builder's scans read a sum of
