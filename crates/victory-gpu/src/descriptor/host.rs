@@ -735,6 +735,10 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// texture it makes, so the bytes DirectStorage put under a texture a moment
 /// ago must be the ones it takes, not those of the upload before them.
 /// Kept only while `VICTORY_BAKE_EXACT` is on ([`crate::draw::bake_exact`]).
+/// Fed only by writes told through `title_memory_written`, which the runtime
+/// does with `VICTORY_STREAM_NOTICE=0`: by default a stream's writes are
+/// told as [`remapped`] memory, which the bake's pass takes at once itself
+/// ([`HostHeap::texture_slots_remapped`]).
 static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// How many ranges [`BAKE_PAGE_WRITTEN`] held after it was last joined: it
@@ -1871,16 +1875,30 @@ impl HostHeap {
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
     /// left to their draws. Returns how many slots it made due.
+    /// The pass before a draw of the title's bake ([`crate::draw::bake_exact`])
+    /// makes the slots of textures that were uploaded before due at once,
+    /// not from the next frame: the bake takes the texture's bytes for good,
+    /// and these are the writes (a stream's, by default: the runtime tells
+    /// of them here, [`crate::watch::writing`]) that landed since a pass
+    /// last looked.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
         join(&mut ranges);
+        self.slots_remapped_in(&ranges, frame, crate::texture::BAKING.get())
+    }
+
+    /// [`HostHeap::texture_slots_remapped`] for `ranges`, joined. With
+    /// `baking`, a slot whose texture was uploaded before (out of the queue,
+    /// or in it after an upload) is due at `frame`, one waiting for its first
+    /// upload from the next frame as ever: that upload takes what is there.
+    fn slots_remapped_in(&self, ranges: &[(u64, u64)], frame: u64, baking: bool) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -1889,10 +1907,15 @@ impl HostHeap {
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at_once = 0u64;
         for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
+            let uploaded =
+                baking && textures.slots.get(&slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0);
+            textures.changed(slot, frame, if uploaded { frame } else { frame + 1 });
+            at_once += u64::from(uploaded);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
+        BAKE_WOKEN.fetch_add(at_once, Relaxed);
         slots.len()
     }
 
@@ -5486,6 +5509,56 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// The pass before a draw of the bake makes the slots of textures that
+    /// were uploaded before due at once when memory under them was written
+    /// (a stream tells of it as `remapped` memory); a slot still waiting for
+    /// its first upload, and any slot outside a bake, are due from the next
+    /// frame. (Ranges are handed over directly: the list `remapped` keeps is
+    /// shared with other tests.)
+    #[test]
+    fn a_bakes_pass_takes_remapped_memory_of_uploaded_textures_at_once() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no other test and no title uses.
+        let at = 0x7fed_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let written = [(at, at + 0x1000)];
+        let woken = || BAKE_WOKEN.load(std::sync::atomic::Ordering::Relaxed);
+        // Waiting for its first upload (looked at, its memory not there yet,
+        // due long after): from the next frame, in a bake too.
+        let before = woken();
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_later(1, write, 100, 8);
+        assert_eq!(slots(100), []);
+        assert_eq!(heap.slots_remapped_in(&written, 50, true), 1);
+        assert_eq!(slots(50), []);
+        assert_eq!(slots(51), [1]);
+        // Uploaded and out of the queue. Outside a bake: from the next frame.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_remapped_in(&written, 60, false), 1);
+        assert_eq!(slots(60), []);
+        assert_eq!(slots(61), [1]);
+        // Uploaded again: in a bake, due at that frame.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_remapped_in(&written, 70, true), 1);
+        assert_eq!(slots(70), [1]);
+        // Memory elsewhere: nothing.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.slots_remapped_in(&[(at + 0x10_0000, at + 0x10_1000)], 80, true), 0);
+        assert_eq!(slots(u64::MAX), []);
+        // Only the one in a bake counts as woken at once (other tests may
+        // add to the count when they run: at least that one).
+        assert!(woken() > before);
     }
 
     #[test]
