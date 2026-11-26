@@ -1,4 +1,22 @@
-# VIctory on NVIDIA
+# VKarameloVI
+
+VKarameloVI runs an Xbox Series title natively on Windows on NVIDIA cards, from files the user supplies. It is
+[VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) (itself built on
+[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) and [VIctory](https://github.com/Marvisak/VIctory))
+as set up and measured on an RTX 4060 Ti 16 GB, Ryzen 5 5600X and 32 GB of RAM: about 7-12 frames a second in the
+world (86-176 ms a frame) with the Series S profile at half render scale, after its shaders and pipelines are warmed
+(`victory warm --used`).
+
+**This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated
+with or endorsed by the game's developer or publisher. Licensed GPL-3.0-or-later, as VIctory; every upstream credit
+below is kept.
+
+What this fork adds on top of VIctory-NVIDIA:
+
+- The window is named VKarameloVI.
+- Scripted keys (`VICTORY_KEYS`, `VICTORY_KEYS_STOP`) work in release builds too, for automatic test runs.
+
+---
 
 ## Built from many projects
 

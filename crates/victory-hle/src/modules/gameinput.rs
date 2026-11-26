@@ -1197,7 +1197,7 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            // (local: in every build, for the FPS benchmark script)
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1209,10 +1209,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1250,7 +1247,7 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    /// (Local: in every build, so that release runs can be measured.)
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1280,6 +1277,23 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
+        // Local: `VICTORY_KEYS_STOP=<file>`: no more keys once that file
+        // exists (the FPS benchmark makes it when the world is there).
+        static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static LOOKED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        if STOPPED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
+        if let Some(file) = std::env::var_os("VICTORY_KEYS_STOP") {
+            let mut looked = LOOKED.lock().unwrap_or_else(|e| e.into_inner());
+            if looked.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+                *looked = Some(Instant::now());
+                if std::path::Path::new(&file).exists() {
+                    STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Vec::new();
+                }
+            }
+        }
         let now = start.elapsed();
         keys.iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
