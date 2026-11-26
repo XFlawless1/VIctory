@@ -13,7 +13,7 @@
 //! it as any texture.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -80,6 +80,8 @@ pub(crate) enum Taken {
 static QUEUE: (Mutex<VecDeque<Arc<Job>>>, Condvar) = (Mutex::new(VecDeque::new()), Condvar::new());
 /// Those on their way, by host copy ([`HostTexture::serial`]).
 static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
+/// How many are on their way ([`drain`] asks without the lock first).
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
 /// Since the start: uploads, bytes, microseconds from the asking until the
@@ -132,7 +134,11 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     }
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(Some(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
-    ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner()).push((job.copy.serial, job.clone()));
+    {
+        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        way.push((job.copy.serial, job.clone()));
+        IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
+    }
     Some(Taken::New(job))
 }
 
@@ -140,6 +146,27 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
 pub(crate) fn send(job: &Arc<Job>) {
     QUEUE.0.lock().unwrap_or_else(|e| e.into_inner()).push_back(job.clone());
     QUEUE.1.notify_one();
+}
+
+/// Waits, for `limit_ms` at most, until every upload now on its way has run
+/// its copy and its `then` calls (which note the slots that show the new
+/// texture: [`crate::descriptor::host::flip_now`], or the next texture pass,
+/// makes them). A draw of the title's bake samples slots through the pass
+/// before it: one whose upload was still on its way showed what stood in for
+/// the texture, and the bake kept that for good in the texture it made.
+/// Returns how many were on their way when it began, and whether the wait
+/// ended with some still there.
+pub(crate) fn drain(limit_ms: u64) -> (usize, bool) {
+    if IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return (0, false);
+    }
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = way.len();
+    let started = std::time::Instant::now();
+    while !way.is_empty() && (started.elapsed().as_millis() as u64) < limit_ms {
+        way = LANDED.wait_timeout(way, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    (waiting, !way.is_empty())
 }
 
 /// A list is about to record an upload into `copy`: one on its way here runs
@@ -291,11 +318,6 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.copy.ahead.store(DONE, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
-    {
-        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-        way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
-        LANDED.notify_all();
-    }
     for job in &jobs {
         let us = job.asked.elapsed().as_micros() as u64;
         let n = STATS[0].fetch_add(1, Relaxed) + 1;
@@ -316,6 +338,15 @@ fn finish(jobs: Vec<Arc<Job>>) {
         for f in then.into_iter().flatten() {
             f();
         }
+    }
+    // Off the list of those on their way only after their `then` calls have
+    // noted their slots, so that [`drain`] returning means the notes are
+    // there for the next texture pass to make.
+    {
+        let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+        IN_FLIGHT.store(way.len(), std::sync::atomic::Ordering::Release);
+        LANDED.notify_all();
     }
     crate::descriptor::host::flip_now();
 }
@@ -413,5 +444,40 @@ mod tests {
             assert!(seen == expected.as_slice(), "level 0's blocks");
             back.Unmap(0, None);
         }
+    }
+
+    /// One on its way: the wait ends after its `then` calls have run, and a
+    /// short limit gives up on one that was never sent. (Modelled on a test
+    /// of codec-d/cool_fox's `drain`. The jobs on their way are shared with
+    /// other tests, so the counts here are lower bounds.)
+    #[test]
+    fn drain_waits_until_then_calls_have_run() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(_host) = crate::host::host() else { return };
+        let desc = [3u32, 0, 0, 0, 128, 0, 128, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays for the test.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(at, 0x5a, whole) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        job.then(move || flag.store(true, std::sync::atomic::Ordering::Release));
+        // Not sent yet: the limit ends the wait, with the job still there.
+        let (waited, left) = drain(30);
+        assert!(waited >= 1 && left);
+        assert!(!ran.load(std::sync::atomic::Ordering::Acquire));
+        send(&job);
+        let (waited, left) = drain(20_000);
+        assert!(waited >= 1 && !left);
+        assert!(ran.load(std::sync::atomic::Ordering::Acquire), "a `then` call must have run before drain returns");
     }
 }

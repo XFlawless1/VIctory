@@ -727,6 +727,46 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+/// Ranges of [`PAGE_WRITTEN`] that a pass took without making their slots
+/// due (`VICTORY_PAGE_WRITES` bit 2 is off by default: made due for every
+/// write it flooded the queue), kept for the next draw of the title's bake,
+/// which makes just the slots under them due at once
+/// ([`HostHeap::texture_slots_bake_written`]). What a bake takes stays in the
+/// texture it makes, so the bytes DirectStorage put under a texture a moment
+/// ago must be the ones it takes, not those of the upload before them.
+/// Kept only while `VICTORY_BAKE_EXACT` is on ([`crate::draw::bake_exact`]).
+static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// How many ranges [`BAKE_PAGE_WRITTEN`] held after it was last joined: it
+/// is joined again when it has doubled, not at every pass.
+static BAKE_JOINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Ranges [`BAKE_PAGE_WRITTEN`] holds at most, after joining. Past it the
+/// ranges are dropped (counted in `PAGE_WRITES[1]`, as [`page_written`]
+/// counts its own).
+const BAKE_KEPT: usize = 1 << 14;
+
+/// Since the start: slots of uploaded placed textures that draws of the bake
+/// made due at once because bytes were written under them since a pass last
+/// looked ([`HostHeap::texture_slots_bake_written`]).
+pub(crate) static BAKE_WOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Keeps `ranges`, taken by a pass that did not make their slots due, for
+/// the next draw of the bake ([`BAKE_PAGE_WRITTEN`]).
+fn keep_for_bake(mut ranges: Vec<(u64, u64)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut kept = BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    kept.append(&mut ranges);
+    if kept.len() >= 256.max(BAKE_JOINED.load(Relaxed).saturating_mul(2)) {
+        join(&mut kept);
+        if kept.len() > BAKE_KEPT {
+            PAGE_WRITES[1].fetch_add(kept.len() as u64, Relaxed);
+            kept.clear();
+        }
+        BAKE_JOINED.store(kept.len(), Relaxed);
+    }
+}
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -1749,7 +1789,7 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1897,14 +1937,47 @@ impl HostHeap {
         if ranges.is_empty() {
             return 0;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        let due = crate::watch::page_writes() & 2 != 0;
+        let made_due = self.slots_written_under(&ranges, frame, due)[2];
+        if !due && crate::draw::bake_exact() {
+            // Not made due now: the next draw of the bake takes them.
+            keep_for_bake(ranges);
+        }
+        made_due
     }
 
-    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
-    /// the slots that held bytes of them, those of them uploaded before,
-    /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
+    /// Makes due at once the uploaded slots of placed textures that hold
+    /// bytes of the ranges written since a pass last made the slots under
+    /// them due ([`BAKE_PAGE_WRITTEN`]): called by the pass before a draw of
+    /// the title's bake, which takes the texture's bytes for good. A slot
+    /// still waiting for its first upload is left as it is (that upload
+    /// takes what is there), as are the slots tables read. Returns how many
+    /// slots it made due.
+    pub(crate) fn texture_slots_bake_written(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let mut ranges = std::mem::take(&mut *BAKE_PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        BAKE_JOINED.store(0, Relaxed);
+        if ranges.is_empty() {
+            return 0;
+        }
+        join(&mut ranges);
+        let mut slots = self.slots_holding_bytes(&ranges, frame);
+        if slots.is_empty() {
+            return 0;
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        for &slot in &slots {
+            textures.changed(slot, frame, frame);
+        }
+        BAKE_WOKEN.fetch_add(slots.len() as u64, Relaxed);
+        slots.len()
+    }
+
+    /// The title slots, sorted, whose placed texture holds bytes of
+    /// `ranges` (start, end), leaving out those a table's draws read
+    /// ([`HostHeap::tabled_lately`]).
+    fn slots_holding_bytes(&self, ranges: &[(u64, u64)], frame: u64) -> Vec<u32> {
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
@@ -1912,6 +1985,15 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        slots
+    }
+
+    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
+    /// the slots that held bytes of them, those of them uploaded before,
+    /// and those made due (the latter, if `due`).
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut slots = self.slots_holding_bytes(ranges, frame);
         let held = slots.len();
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         // Uploaded before: out of the queue, or in it after an upload (in
@@ -5281,6 +5363,49 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// Bytes written under a placed texture that a pass left alone (as
+    /// `VICTORY_PAGE_WRITES` does by default) are kept for the draw of the
+    /// bake, whose pass makes that slot due at once, once. A slot waiting for
+    /// its first upload is left alone: that upload takes what is there. (The
+    /// ranges are handed over here, not through `page_written`'s list; the
+    /// kept ranges are shared with other tests, which write elsewhere.)
+    #[test]
+    fn bytes_written_under_a_texture_wake_its_slot_at_the_next_bake() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no other test and no title uses.
+        let at = 0x7fee_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let written = (at, at + 0x1000);
+        // Waiting for its first upload: the bake's pass leaves it as it is.
+        keep_for_bake(vec![written]);
+        assert_eq!(heap.texture_slots_bake_written(50), 0);
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 1);
+        // Uploaded and out of the queue.
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(slots(u64::MAX), []);
+        // Memory elsewhere: nothing, and nothing is due.
+        keep_for_bake(vec![(at + 0x10_0000, at + 0x10_1000)]);
+        assert_eq!(heap.texture_slots_bake_written(60), 0);
+        assert_eq!(slots(u64::MAX), []);
+        // Under it, many small adjacent writes as a stream makes them (they
+        // are joined once there are enough): due at that frame, not before.
+        keep_for_bake((0..300).map(|i| (at + i * 0x10, at + (i + 1) * 0x10)).collect());
+        assert_eq!(heap.texture_slots_bake_written(70), 1);
+        assert_eq!(slots(69), []);
+        assert_eq!(slots(70), [1]);
+        // Taken: the next bake finds nothing more to wake.
+        heap.texture_slot_done(1, heap.texture_slots_due(70, 8).0[0].1, None);
+        assert_eq!(heap.texture_slots_bake_written(71), 0);
+        assert_eq!(slots(u64::MAX), []);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

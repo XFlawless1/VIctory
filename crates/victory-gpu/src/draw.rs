@@ -104,11 +104,31 @@ fn early_budgets() -> (u64, u64) {
 /// (another texture's), and what it bakes stays: coloured specks all over
 /// the waitress's face for the whole diner scene (run n01), none in other
 /// runs. So the pass ahead of a bake takes those slots too, and its uploads
-/// wait for title memory that is being remapped (`crate::texture` `BAKING`).
-fn bake_exact() -> bool {
+/// wait for title memory that is being remapped (`crate::texture` `BAKING`,
+/// which [`crate::texture::Staging::exact`] reads: the reader of it was lost
+/// when uploads stopped waiting for mapping, and came back with that field),
+/// take the slots under bytes DirectStorage wrote since a pass last looked
+/// ([`crate::descriptor::host::HostHeap::texture_slots_bake_written`]), and
+/// first wait for uploads ahead of the lists that are on their way
+/// ([`crate::texture::ahead::drain`]).
+pub(crate) fn bake_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
+
+/// The longest a draw of the bake waits, in milliseconds, for the uploads
+/// ahead of the lists that are on their way ([`bake_exact`];
+/// `VICTORY_BAKE_DRAIN_MS`, 2000; 0: does not wait). They take a few
+/// milliseconds; the limit is for one that never ends.
+fn bake_drain_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_BAKE_DRAIN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000))
+}
+
+/// Since the start: draws of the bake that waited for uploads on their way
+/// ([`bake_drain_ms`]), the uploads they found, the microseconds they waited,
+/// and the waits that ended at the limit with uploads still on their way.
+static BAKE_DRAINS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
@@ -2067,8 +2087,34 @@ impl State {
                 queued_at_the_last_pass = slots,
                 due_at_the_last_pass = due,
                 uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                made_due_by_page_writes = crate::descriptor::host::BAKE_WOKEN.load(Ordering::Relaxed),
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
+        }
+        // Uploads ahead of the lists that are on their way show their texture
+        // only when they have run: the bake would sample what stands in for
+        // it and keep that. The wait is not part of the bake's time budget.
+        if bake && bake_exact() && bake_drain_ms() > 0 {
+            let waited_from = std::time::Instant::now();
+            let (jobs, left) = crate::texture::ahead::drain(bake_drain_ms());
+            if jobs > 0 {
+                let n = BAKE_DRAINS[0].fetch_add(1, Ordering::Relaxed) + 1;
+                BAKE_DRAINS[1].fetch_add(jobs as u64, Ordering::Relaxed);
+                let us = waited_from.elapsed().as_micros() as u64;
+                let all = BAKE_DRAINS[2].fetch_add(us, Ordering::Relaxed) + us;
+                let timed_out = BAKE_DRAINS[3].fetch_add(u64::from(left), Ordering::Relaxed) + u64::from(left);
+                if n.is_power_of_two() || (left && timed_out.is_power_of_two()) {
+                    tracing::info!(
+                        frame,
+                        waits = n,
+                        uploads_found_on_their_way = BAKE_DRAINS[1].load(Ordering::Relaxed),
+                        waited_ms = all / 1000,
+                        last_wait_us = us,
+                        ended_at_the_limit = timed_out,
+                        "a draw of the title's decoration bake waited for uploads ahead of the lists (VICTORY_BAKE_DRAIN_MS=0: does not)"
+                    );
+                }
+            }
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
@@ -2223,6 +2269,13 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        let baking = crate::texture::BAKING.get();
+        if baking {
+            // The pass before a draw of the bake also takes the slots under
+            // bytes written since a pass last looked, which a pass leaves
+            // alone otherwise (`bake_exact`).
+            host.texture_slots_bake_written(frame);
+        }
         host.texture_slots_short(frame);
         // The slots of textures whose first level with memory (levels on
         // demand), or whose host copy for one with more levels, changed since
@@ -2235,7 +2288,6 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let baking = crate::texture::BAKING.get();
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
