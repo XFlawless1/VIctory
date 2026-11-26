@@ -128,7 +128,7 @@ fn bake_drain_ms() -> u64 {
 /// Since the start: draws of the bake that waited for uploads on their way
 /// ([`bake_drain_ms`]), the uploads they found, the microseconds they waited,
 /// and the waits that ended at the limit with uploads still on their way.
-static BAKE_DRAINS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub(crate) static BAKE_DRAINS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as

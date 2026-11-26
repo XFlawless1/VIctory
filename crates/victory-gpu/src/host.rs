@@ -8688,6 +8688,20 @@ impl Meter {
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
             }
+            {
+                let [unchanged, changed] =
+                    [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                let [waits, jobs, waited_us, at_limit] =
+                    [0, 1, 2, 3].map(|i| crate::draw::BAKE_DRAINS[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "looks at uploaded textures picked by index, since the start: {unchanged} found the memory as it was, {changed} \
+                     found it changed and uploaded it again; draws of the title's bake (VICTORY_BAKE_EXACT=0: as before): {} slots \
+                     of uploaded textures made due at once by bytes written under them, {waits} waits for uploads ahead of the lists \
+                     ({jobs} uploads, {:.1} ms in all, {at_limit} ended at the limit)",
+                    crate::descriptor::host::BAKE_WOKEN.load(Ordering::Relaxed),
+                    waited_us as f64 / 1e3
+                );
+            }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
