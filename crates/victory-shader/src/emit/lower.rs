@@ -727,6 +727,83 @@ fn lane_uniform(
     }
 }
 
+/// `VICTORY_LANE_UNIFORM=0`: the proof of which vector values are the same in every lane of a
+/// console wave is the one this tree had before the Belobug fork's ([`lane_uniform_before`]),
+/// which took more values as alike (A/B: five programs of the title translate differently).
+/// Part of the translation: the shader cache keys on it.
+fn strict_uniform() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_STRICT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_UNIFORM").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`strict_uniform`], for its thread only.
+    pub(super) static TEST_STRICT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`lane_uniform`] as this tree had it before 431cab5d and the fixes after it of the Belobug
+/// fork (`VICTORY_LANE_UNIFORM=0`). VGPR values that are the same in every lane holding them
+/// (`all` is [`all_lane_blocks`]): written by an instruction every arriving lane runs (no
+/// guard), lane by lane, from scalars, constants and such values; or loaded from an address made
+/// of them. A value joined by a phi counts only where every predecessor is a block all lanes
+/// run; loop-carried values never do. It also took the registers an instruction reads from an
+/// operand's register upward as the operand's, a scalar it could not follow as alike, a
+/// `v_cndmask_b32` on any scalar mask that was not a known lane mask, and left out the old
+/// value of a destination (`v_mac`, `v_swap`).
+fn lane_uniform_before(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut same: HashSet<Value> = HashSet::new();
+    for b in crate::ir::reverse_postorder(&p.blocks) {
+        let block = &p.blocks[b];
+        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+                same.insert(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            let ops: Vec<Operand> = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.contains("lane") =>
+                {
+                    v.src.clone()
+                }
+                _ => continue,
+            };
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
+            let alike = ops.iter().all(|op| match *op {
+                Operand::Vector { reg, .. } => {
+                    // every dword of the operand the instruction reads from that register on
+                    let read: Vec<Value> =
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                }
+                // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                Operand::Scalar { code, .. } if code != NULL => {
+                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                }
+                _ => true,
+            });
+            if alike {
+                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+            }
+        }
+    }
+    same
+}
+
 /// The thread id's x (`v0` on entry) of a console wave64 compute program whose console waves are
 /// runs of 64 ids along x (a group 64-aligned along x, or one row): `id >> 6` and up is then one
 /// value per console wave ([`lane_uniform`]).
@@ -1827,7 +1904,13 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    if strict_uniform() {
+                        lane_uniform(p, x.st, all, wave_tid(p, x))
+                    } else {
+                        lane_uniform_before(p, x.st, all)
+                    }
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {

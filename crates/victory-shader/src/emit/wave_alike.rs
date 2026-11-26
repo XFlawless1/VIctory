@@ -39,6 +39,11 @@
 //!
 //! Anything else is refused there as before ("a first-lane read where not every lane runs")
 //! and left to the forms of the program in which every lane runs that code. `VICTORY_FIRSTLANE_ALIKE=0` turns this off.
+//!
+//! (The lane-uniformity proof `lower::lane_uniform` of the Belobug fork, ported after this, proves the same
+//! scans by another route, and a read it proves takes the host wave's own first lane before this module is
+//! asked: `VICTORY_FIRSTLANE_ALIKE=0` alone leaves these scans exact; `VICTORY_LANE_UNIFORM=0` as well gives the
+//! old refusal.)
 
 use std::collections::{HashMap, HashSet};
 
