@@ -1471,7 +1471,8 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
-    if most == 0 {
+    // (`VICTORY_AB=<s>,VICTORY_WIDE_SPIN_ON` turns the spinning on and off while the title runs.)
+    if most == 0 || !crate::toggled!("VICTORY_WIDE_SPIN_ON") {
         return;
     }
     let began = std::time::Instant::now();

@@ -218,12 +218,26 @@ static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
+    let key = command_key(op);
+    {
+        // The note of the longest one of each kind, for the lines that say
+        // what the heaviest commands bind (the buffers, their sizes).
+        let mut longest = LONGEST_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
+        let e = longest.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((0, String::new()));
+        if us > e.0 {
+            *e = (us, op.chars().take(1500).collect());
+        }
+    }
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
+    let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0));
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
 }
+
+/// With `VICTORY_GPU_TIMING`: per kind of command ([`command_key`]), the
+/// longest one's microseconds and its whole note, since the start.
+static LONGEST_COMMAND: Mutex<Option<HashMap<String, (u64, String)>>> = Mutex::new(None);
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
 /// `[mesh ..., pixel ...]`) with the command's first word, or without a
@@ -1335,14 +1349,22 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    let notes = LONGEST_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, (what, (n, us, longest))) in by.into_iter().take(40).enumerate() {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
         );
+        // What the heaviest bind: the whole note of the longest one (since the start).
+        if i < 8
+            && let Some((_, note)) = notes.as_ref().and_then(|m| m.get(&what))
+        {
+            tracing::info!("    its longest one: {note}");
+        }
     }
+    drop(notes);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
