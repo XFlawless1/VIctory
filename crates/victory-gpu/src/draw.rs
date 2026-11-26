@@ -2809,6 +2809,18 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        // `VICTORY_TRACE_SLOTS`: heap indices (comma-separated) a shader
+        // reads through the heap itself, and what the host holds there now.
+        static SLOTS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        let slots = SLOTS.get_or_init(|| {
+            let v = std::env::var("VICTORY_TRACE_SLOTS").unwrap_or_default();
+            v.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        });
+        if let Some(h) = views {
+            for &i in slots {
+                let _ = write!(text, " slot{i}={:?}", h.describe_slot(i));
+            }
+        }
         if !compute && !list_slots().is_empty() {
             text.push_str(&self.slots_text());
         }
@@ -3895,18 +3907,31 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+        let execute = || {
+            // SAFETY: an open list with everything set; the scratch buffer
+            // and host copies are kept alive by the list, and the signature
+            // is cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            }
         };
+        // Draws of a listed frame, with `VICTORY_DUMP_TARGETS`: between a
+        // statistics query (`draw statistics` in the log).
+        #[cfg(feature = "diagnostics")]
+        if kind != DISPATCH && crate::capture::stats_wanted() {
+            crate::capture::with_stats(list, p.name.clone(), execute);
+        } else {
+            execute();
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        execute();
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4331,25 +4356,45 @@ fn describe(view: Option<&View>) -> String {
                 crate::descriptor::host::buffer_range(v)
             ),
         },
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
-        // The first four values, as a colour rectangle's constants are.
+        Some(View::Placed(u, r, d)) => {
+            let (width, at) = (u64::from(r[4]) | u64::from(r[5]) << 32, u64::from(d[10]) | u64::from(d[11]) << 32);
+            // `VICTORY_TRACE_CBV`: a small raw or structured buffer's
+            // dwords, in hex (heap indices and counts are not floats).
+            let all = (r[0] == 1 && width <= 16384 && crate::switch::on("VICTORY_TRACE_CBV"))
+                .then(|| trace_dwords(at, width as usize))
+                .flatten()
+                .unwrap_or_default();
+            format!(
+                "placed uav={u} dim {} {}x{} f{} layout {:#x} at {at:#x}{all}",
+                r[0], width, r[6], r[8], r[11]
+            )
+        }
+        // The first four values, as a colour rectangle's constants are
+        // (`VICTORY_TRACE_CBV`: every dword, in hex).
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
         {
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+            let all = crate::switch::on("VICTORY_TRACE_CBV")
+                .then(|| trace_dwords(*address, (*size as usize).min(4096)))
+                .flatten()
+                .unwrap_or_default();
+            format!("Constant({address:#x}, {size}) {v:?}{all}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// `bytes` of title memory at `address` as dwords in hex (` dwords [..]`),
+/// for `VICTORY_TRACE_CBV`; None if unreadable.
+#[cfg(feature = "diagnostics")]
+fn trace_dwords(address: u64, bytes: usize) -> Option<String> {
+    let mut all = vec![0u8; bytes & !3];
+    crate::host::read_into(address as *const u8, &mut all).then(|| {
+        let w: Vec<u32> = all.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect();
+        format!(" dwords {w:x?}")
+    })
 }
 
 /// The console's own primitive topologies.

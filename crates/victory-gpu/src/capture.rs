@@ -361,6 +361,114 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
+/// Whether the draw being recorded is wanted with its statistics
+/// ([`with_stats`]): `VICTORY_DUMP_TARGETS`, and the frame being built is
+/// listed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stats_wanted() -> bool {
+    dump_on() && listed(crate::queue::presented() + 1)
+}
+
+/// A draw's statistics query, resolved on the list and read at the present
+/// of its frame ([`log_statistics`]), when every submission has run.
+#[cfg(feature = "diagnostics")]
+struct Statistics {
+    frame: u64,
+    name: String,
+    // Kept alive until the list has run.
+    _heap: ID3D12QueryHeap,
+    buffer: ID3D12Resource,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the buffer is read only at the
+// present, on one thread.
+#[cfg(feature = "diagnostics")]
+unsafe impl Send for Statistics {}
+
+#[cfg(feature = "diagnostics")]
+static STATISTICS: std::sync::Mutex<Vec<Statistics>> = std::sync::Mutex::new(Vec::new());
+
+/// With `VICTORY_DUMP_TARGETS`, in a listed frame: records `draw` between a
+/// pipeline-statistics query, and logs at the frame's present how many
+/// vertices it shaded and how many pixels, to tell a draw that covers
+/// nothing (culled tiles, a depth test that passes none) from one whose
+/// shaders write black:
+/// `draw statistics: <n> vertices, <n> primitives in, <n> out of the clipper, <n> pixels shaded: <pipeline> frame <n>`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn with_stats(list: &crate::host::HostList, name: String, draw: impl FnOnce()) {
+    let Some(host) = crate::host::host() else { return draw() };
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Count: 1, NodeMask: 0 };
+    // SAFETY: plain creation.
+    if unsafe { host.device.CreateQueryHeap(&desc, &mut heap) }.is_err() {
+        return draw();
+    }
+    let Some(heap) = heap else { return draw() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    if unsafe {
+        host.device
+            .CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+    }
+    .is_err()
+    {
+        return draw();
+    }
+    let Some(buffer) = buffer else { return draw() };
+    let kind = D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
+    // SAFETY: an open list, a live heap and a buffer in the copy destination state.
+    unsafe { list.list.BeginQuery(&heap, kind, 0) };
+    draw();
+    // SAFETY: as above.
+    unsafe {
+        list.list.EndQuery(&heap, kind, 0);
+        list.list.ResolveQueryData(&heap, kind, 0, 1, &buffer, 0);
+    }
+    list.keep(&heap);
+    list.keep(&buffer);
+    let frame = crate::queue::presented() + 1;
+    STATISTICS.lock().unwrap_or_else(|e| e.into_inner()).push(Statistics { frame, name, _heap: heap, buffer });
+}
+
+/// At the present of a listed frame (every submission has run): logs the
+/// statistics of its draws ([`with_stats`]).
+#[cfg(feature = "diagnostics")]
+fn log_statistics() {
+    let all = std::mem::take(&mut *STATISTICS.lock().unwrap_or_else(|e| e.into_inner()));
+    for s in all {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the list has run; the mapping holds the resolved statistics.
+        unsafe {
+            if s.buffer.Map(0, None, Some(&mut data)).is_err() {
+                continue;
+            }
+            let q = data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>().read_unaligned();
+            tracing::info!(
+                target: "victory_gpu::trace",
+                "draw statistics: {} vertices, {} primitives in, {} out of the clipper, {} pixels shaded: {} frame {}",
+                q.VSInvocations,
+                q.IAPrimitives,
+                q.CPrimitives,
+                q.PSInvocations,
+                s.name,
+                s.frame
+            );
+            s.buffer.Unmap(0, None);
+        }
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
@@ -377,6 +485,8 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(feature = "diagnostics")]
+    log_statistics();
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -605,8 +715,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        // Integer targets (R32_UINT, R32_SINT) by value: their bits read as
+        // floats are denormals, so masks and counts all came out black.
+        42 => (4, Box::new(move |b| [u32_at(b, 0) as f32; 3])),
+        43 => (4, Box::new(move |b| [u32_at(b, 0) as i32 as f32; 3])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
