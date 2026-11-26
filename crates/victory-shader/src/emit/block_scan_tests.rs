@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use super::host::{Dispatch, Host, Root, View};
 use super::wave64_tests::{lowered, native_of};
-use super::{validator, wave_alike};
+use super::{lower, validator, wave_alike};
 use crate::native::{NativeProgram, StageIo};
 use crate::{ShaderError, ir, structure};
 
@@ -256,17 +256,33 @@ fn a_scan_over_several_console_waves_is_the_prefix_sum_in_waves_of_32() {
     }
 }
 
-/// With `VICTORY_FIRSTLANE_ALIKE=0` the program is refused as it was.
+/// With `VICTORY_FIRSTLANE_ALIKE=0` and `VICTORY_LANE_UNIFORM=0` the program is refused as it was.
 #[test]
-fn without_the_proof_the_scan_is_refused_as_it_was() {
+fn without_the_proofs_the_scan_is_refused_as_it_was() {
     let native = whole(512, &term(), V_MOV_V13_S16, S_BARRIER, &[]);
     let p = built(&native);
     let was = wave_alike::TEST_ALIKE.replace(Some(false));
+    let before = lower::TEST_STRICT.replace(Some(false));
     let refused = lowered(&native, &p, &HashSet::new());
+    lower::TEST_STRICT.set(before);
     wave_alike::TEST_ALIKE.set(was);
     assert!(
         matches!(&refused, Err(ShaderError::Unsupported { what, .. }) if *what == "a first-lane read where not every lane runs"),
         "{:?}",
         refused.err()
     );
+}
+
+/// `VICTORY_FIRSTLANE_ALIKE=0` alone does not refuse the scan any more: the Belobug fork's
+/// lane-uniformity proof (`lower::lane_uniform`: a value made under a condition alike in the
+/// console wave, an LDS read at an alike address) proves the same read, and takes the host
+/// wave's own first lane. (Both proofs have to be off for the old refusal.)
+#[test]
+fn the_lane_uniformity_proof_alone_translates_the_scan() {
+    let native = whole(512, &term(), V_MOV_V13_S16, S_BARRIER, &[]);
+    let p = built(&native);
+    let was = wave_alike::TEST_ALIKE.replace(Some(false));
+    let shader = lowered(&native, &p, &HashSet::new());
+    wave_alike::TEST_ALIKE.set(was);
+    assert!(shader.is_ok(), "{:?}", shader.err());
 }

@@ -104,7 +104,8 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
-| `VICTORY_FIRSTLANE_ALIKE=0` | 32-lane waves: a first-lane read where not every lane runs is refused as before, whatever it reads (the builder's three block scans then do not translate, and the builder stays off) |
+| `VICTORY_FIRSTLANE_ALIKE=0` | 32-lane waves: this module's proof is off; with `VICTORY_LANE_UNIFORM=0` as well, a first-lane read where not every lane runs is refused as before, whatever it reads (the builder's three block scans then do not translate, and the builder stays off). With this one alone they still translate: the lane-uniformity proof of the Belobug fork (`lower::lane_uniform`) proves the same reads |
+| `VICTORY_LANE_UNIFORM=0` | 32-lane waves: the lane-uniformity proof is the one this tree had before the Belobug fork's (five programs of the title translate as before; see findings.md) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
