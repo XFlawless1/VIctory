@@ -589,5 +589,11 @@ holds the title's update back). The title's frame interval is 33.333 ms, as it a
 here and none was needed.
 
 Not shown: how this looks with Smooth Motion on (the frame generation was off in every run, `-NoSmoothMotion`); that
-other textures the title rewrites at every draw look better (the same step is taken for all of them); the world frame
-is told below once the runs are done.
+other textures the title rewrites at every draw look better (the same step is taken for all of them).
+
+The world frame, 240 s runs (Enter every 8 s from 45 s, the prison at about 200 s), the medians of the last ten
+five-second lines of each: old 42.9 and 39.2 ms, fix 38.5 and 45.2 ms (two runs each, in the order old, fix, fix, old):
+the runs differ from each other by more than the two builds do, and the fix is neither shown faster nor slower. All four
+reached the world with no device removal in the log; each had one or two windows of the entry into the world of 160 to
+4,300 ms a frame (the old and the fixed alike). The uploads the fix adds are three textures of 12.5 MB at 30 a
+second where there were half as many; the detiling was done at every present before.
