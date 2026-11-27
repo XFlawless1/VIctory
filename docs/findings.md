@@ -131,7 +131,7 @@ What was changed (all on; `=0` is the old behaviour):
   the draw, not once each (numbered as of the end of the draw, so dropped no earlier than before).
 - Not switchable, same work: `make_listed` looks into the thread's table once, not twice; `AddressHash` takes a word at a
   time (a three-word record was twelve rounds); the list's states, twins, texture set and alias table use it.
-- `VICTORY_CAPTURE_COMPOSED=1` (diagnostics): the captured frame is the one shown, the interface laid over the game.
+- `VICTORY_CAPTURE_COMPOSED=1` (diagnostics): the captured frame is the one shown, the interface laid over the game. After the merge with the ambient branch this is the default (`VICTORY_CAPTURE_GAME_PLANE=1` gives the game's plane alone, as before); the switch is no longer read.
 
 Measured inside one run with the two switches on and off in turn (`VICTORY_AB=4,VICTORY_READY_ENTRIES,VICTORY_RETIRE_BATCH`,
 world phases of 4,300-4,700 draws a frame, a cycle is four phases):
@@ -387,3 +387,27 @@ logs a device removal, a panic or an access violation (the patch's author report
 a different card and system). The frames captured at 4,800 show the same scene with and without the switch (camera and
 animation differ between runs; no black-and-red blocks on the jumpsuit in either, which that author saw by eye without it);
 nothing here shows a picture difference, and no frame cost of the paired form shows in these runs.
+
+## The light stand-in settles by the clock (2026-11-27, ported from Belobug/VIctory-Belobug-AMD)
+
+`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh seconds>]]` (unset: `250,3`; `0`: the old 0.04 of the
+way a frame). The slow mean of the light around (the stand-in's memory of the room, 20 % of every pixel's estimate) used
+to follow by 0.04 a frame: 25 frames, 0.8 s at the console's 30 frames a second but 2 to 4 s at 7 to 13, so walking into a
+room left it too bright or too dark for seconds. Now it follows by a share of the time (the same a second whatever the
+frame rate), and a change of the mean by more than the jump factor (3, either way: a door, a lamp) is taken at once. The
+optional third number bounds the title's leftover by the estimate for that many seconds after such a jump (default 0: not
+done). Taken from b4ba4bbb and 9576c45f of that fork (GPL-3.0-or-later; its default is the same, from its
+`reports/LIGHT-POPIN.md`), without its light probe (`lightprobe.rs`, the sums in a fourth buffer) and without its filter
+of magenta probes (which it says AMD's uninitialised memory makes). This supersedes the entry above that left the series
+out for its conflicts: only the part in `ambient.rs` was needed.
+
+Tested: the settings parse (`settle_settings`), the share is the same a second at any frame rate, and the pass runs on
+the card (`the_slow_mean_follows_jumps_and_ages`: half the way, a jump up and down taken at once with the age restarted,
+no jump factor, the first frame). NOT shown: that rooms look better after walking in on this PC; no pictures compared.
+
+## The frame capture saves the picture that is shown
+
+`VICTORY_CAPTURE` read back the first plane (the game's) only, so every loading screen, title card and intro, which the
+Series S title draws on the second plane (the interface, laid over the game by `compose.rs`), was saved black. It now
+reads back the composed picture when the planes were laid over each other (`VICTORY_CAPTURE_GAME_PLANE=1`: the game's
+plane alone, as before).

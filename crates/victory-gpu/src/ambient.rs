@@ -112,6 +112,88 @@ fn air() -> f32 {
     })
 }
 
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
+/// frames: 0.8 s at the console's 30 frames a second, 2-4 s at 7-13). Set,
+/// it is the same share of the way a second whatever the frame rate, and a
+/// change by more than the jump factor (default 3; 0: none) is taken at
+/// once. Fresh seconds (default 0: none): for that long after such a jump
+/// the light the title's own resolve left is bounded by the estimate, not
+/// four times it, rising back to four times by the end.
+///
+/// Ported from Belobug/VIctory-Belobug-AMD (b4ba4bbb, 9576c45f, GPL-3.0-or-later;
+/// the same default there, from its reports/LIGHT-POPIN.md), without its light
+/// probe and without its filter of magenta probes (AMD's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+/// [`Settle`] from the text of `VICTORY_AMBIENT_SETTLE`: `None` (the old 0.04 a
+/// frame) if the time constant is not a number above 0.
+fn parse_settle(set: &str) -> Option<Settle> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+    let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+    let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+    let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    Some(Settle { ms, jump, fresh })
+}
+
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = parse_settle(&std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned()));
+        if let Some(Settle { ms, jump, fresh }) = set {
+            tracing::info!(ms, jump, fresh, "the stand-in's mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE)");
+        }
+        set
+    })
+}
+
+/// The share of the way the slow mean goes at this frame's keeping, `dt`
+/// milliseconds after the last ([`Role::Radiance`]; the other passes do not
+/// read it).
+fn follow(role: Role, dt: f32) -> f32 {
+    match settle() {
+        Some(settle) if role == Role::Radiance => follow_by(dt, settle.ms),
+        _ => 0.04,
+    }
+}
+
+/// The share of the way a mean with time constant `ms` goes in `dt` milliseconds.
+fn follow_by(dt: f32, ms: f32) -> f32 {
+    1.0 - (-dt / ms).exp()
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30. Other
+/// roles: the last answer.
+fn frame_ms(role: Role) -> f32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static DT: AtomicU32 = AtomicU32::new(0x4204_0000); // 33.0
+    if role != Role::Radiance {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    // (Asked twice in a keeping: the words and the share.)
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if ASKED.swap(now, Relaxed) == now {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let last = LAST.swap(now, Relaxed);
+    let dt = match now.saturating_sub(last) {
+        0 => 1.0,
+        dt if last == 0 || dt > 1000 => 33.0,
+        dt => dt as f32,
+    };
+    DT.store(dt.to_bits(), Relaxed);
+    dt
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -128,7 +210,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -138,6 +220,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
+    float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -179,7 +262,14 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
 }
 #endif
 
@@ -322,8 +412,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    // outdoors, not the blocks of other memory. For `fresh` seconds after the
+    // light around jumped (a new room) it counts for no more than the
+    // estimate, then up to `most` times it again: its history holds the
+    // place before.
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));
@@ -452,15 +546,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 15];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
+    let dt = frame_ms(role);
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = 0.04f32.to_bits();
+    words[8] = follow(role, dt).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+    words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+    words[14] = (dt / 1000.0).to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -468,7 +566,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -526,5 +624,111 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+    }
+
+    #[test]
+    fn settle_settings() {
+        // Unset is the default: 250 ms, a jump factor of 3, no fresh seconds.
+        assert_eq!(parse_settle("250,3"), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
+        assert_eq!(parse_settle("500"), Some(Settle { ms: 500.0, jump: 3.0, fresh: 0.0 }));
+        assert_eq!(parse_settle("400, 0 , 2.5"), Some(Settle { ms: 400.0, jump: 0.0, fresh: 2.5 }));
+        // 0, nothing and nonsense: the old 0.04 a frame.
+        assert_eq!(parse_settle("0"), None);
+        assert_eq!(parse_settle(""), None);
+        assert_eq!(parse_settle("fast"), None);
+        assert_eq!(parse_settle("-5,3"), None);
+        assert_eq!(parse_settle("nan"), None);
+        // A bad second or third part is the default, not the end of the setting.
+        assert_eq!(parse_settle("250,x,y"), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
+    }
+
+    #[test]
+    fn the_share_of_the_way_is_the_same_a_second_whatever_the_frame_rate() {
+        // 250 ms: a frame of 33 ms goes about 12 % of the way, a frame of 100 ms 33 %.
+        assert!((follow_by(33.0, 250.0) - 0.1237).abs() < 1e-3);
+        assert!((follow_by(100.0, 250.0) - 0.3297).abs() < 1e-3);
+        // Thirty frames of 33 ms and ten of 100 ms leave the same share of what was.
+        let left = |dt: f32, frames: i32| (1.0 - follow_by(dt, 250.0)).powi(frames);
+        assert!((left(1000.0 / 30.0, 30) - left(100.0, 10)).abs() < 2e-3);
+        // At the console's 30 frames a second the share a frame is above the old 0.04.
+        assert!(follow_by(1000.0 / 30.0, 250.0) > 0.04);
+    }
+
+    /// The pass that takes the slow mean (`mean`) on the card: cells that all hold `now`, the mean `was` (red,
+    /// green, blue, age) kept before, and the settings (follow, jump, fresh, dt) as the words give them; what it kept.
+    fn kept(host: &crate::host::Host, pass: &Pass, now: f32, was: [f32; 4], [follow, jump, fresh, dt]: [f32; 4]) -> [f32; 4] {
+        let (up, data) = host.upload_buffer(CELL_BYTES).expect("an upload buffer");
+        let mut cells = vec![[now, now, now, 1.0f32]; CELLS as usize + 1];
+        cells[CELLS as usize] = was;
+        // SAFETY: the mapping spans CELL_BYTES; plain floats.
+        unsafe { std::ptr::copy_nonoverlapping(cells.as_ptr().cast::<u8>(), data, cells.len() * 16) };
+        let back = host.read_back_buffer(16).expect("a read-back buffer");
+        let mut words = [0u32; 15];
+        words[8] = follow.to_bits();
+        words[9] = 4.0f32.to_bits();
+        words[12] = jump.to_bits();
+        words[13] = fresh.to_bits();
+        words[14] = dt.to_bits();
+        let list = host.new_list().expect("a list");
+        let t = crate::host::transition;
+        let (common, copy_to, uav, copy_from) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        // SAFETY: an open list; live buffers; one thread group, as the pass runs.
+        unsafe {
+            let l = &list.list;
+            l.ResourceBarrier(&[t(&pass.cells, common, copy_to)]);
+            l.CopyBufferRegion(&pass.cells, 0, &up, 0, CELL_BYTES);
+            l.ResourceBarrier(&[t(&pass.cells, copy_to, uav)]);
+            l.SetComputeRootSignature(&pass.root);
+            l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+            l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+            l.SetPipelineState(&pass.mean);
+            l.Dispatch(1, 1, 1);
+            uav_barrier(l);
+            l.ResourceBarrier(&[t(&pass.cells, uav, copy_from)]);
+            l.CopyBufferRegion(&back, 0, &pass.cells, CELLS * 16, 16);
+            l.ResourceBarrier(&[t(&pass.cells, copy_from, common)]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut seen = [0.0f32; 4];
+        // SAFETY: the mapping spans the 16 bytes the copy wrote, and has finished.
+        unsafe {
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data)).expect("a mapping");
+            std::ptr::copy_nonoverlapping(data.cast::<f32>(), seen.as_mut_ptr(), 4);
+            back.Unmap(0, None);
+        }
+        seen
+    }
+
+    /// The slow mean on the card: follows by the share it is given, takes a jump at once, counts the seconds since.
+    #[test]
+    fn the_slow_mean_follows_jumps_and_ages() {
+        let Some(host) = host() else {
+            return;
+        };
+        let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        let near = |got: [f32; 4], want: [f32; 4]| got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-4);
+        // A change by a factor of 2 (under the jump factor 3): half the way, 0.5 + 0.03 s old.
+        let got = kept(host, &pass, 0.4, [0.2, 0.2, 0.2, 0.5], [0.5, 3.0, 0.0, 0.03]);
+        assert!(near(got, [0.3, 0.3, 0.3, 0.53]), "half the way: {got:?}");
+        // A change by a factor of 10: taken at once, the age starts again.
+        let got = kept(host, &pass, 1.0, [0.1, 0.1, 0.1, 5.0], [0.5, 3.0, 0.0, 0.03]);
+        assert!(near(got, [1.0, 1.0, 1.0, 0.001]), "a jump up: {got:?}");
+        // The same the other way: a lamp off.
+        let got = kept(host, &pass, 0.1, [1.0, 1.0, 1.0, 5.0], [0.5, 3.0, 0.0, 0.03]);
+        assert!(near(got, [0.1, 0.1, 0.1, 0.001]), "a jump down: {got:?}");
+        // No jump factor (0, and the old 0.04 a frame): the same change follows the share, however large.
+        let got = kept(host, &pass, 1.0, [0.1, 0.1, 0.1, 5.0], [0.04, 0.0, 0.0, 0.03]);
+        assert!(near(got, [0.136, 0.136, 0.136, 5.03]), "no jump factor: {got:?}");
+        // Nothing kept yet (age 0): the first frame's light as it is.
+        let got = kept(host, &pass, 0.7, [0.0, 0.0, 0.0, 0.0], [0.04, 3.0, 0.0, 0.03]);
+        assert!(near(got, [0.7, 0.7, 0.7, 0.001]), "the first frame: {got:?}");
     }
 }

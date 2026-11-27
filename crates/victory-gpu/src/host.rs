@@ -9204,12 +9204,13 @@ impl Host {
             for _ in 0..probe::gpu_copies() {
                 list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             }
-            // (`VICTORY_CAPTURE_COMPOSED=1`: what is shown, the interface laid over the game, not the game's plane alone,
-            // which is black while the title loads.)
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
+                // What is shown: the interface laid over the game when it was (`VICTORY_CAPTURE_GAME_PLANE=1`: the
+                // game's plane alone, as before; a loading screen or a title card lives on the interface plane and was
+                // saved black).
                 .then(|| {
-                    let shown = laid.as_ref().filter(|_| crate::switch::on("VICTORY_CAPTURE_COMPOSED")).unwrap_or(texture);
+                    let shown = if crate::switch::on("VICTORY_CAPTURE_GAME_PLANE") { texture } else { laid.as_ref().unwrap_or(texture) };
                     crate::capture::read_back(&self.device, list, shown)
                 })
                 .flatten();
