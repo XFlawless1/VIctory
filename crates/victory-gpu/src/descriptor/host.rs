@@ -2580,6 +2580,15 @@ impl HostHeap {
         });
     }
 
+    /// Whether some slot of this heap shows the neutral texture or the view it
+    /// showed before, until submissions in flight have run
+    /// ([`HostHeap::texture_slots_flip`] flips it then): what a draw of the
+    /// title's bake would sample instead of the texture it means.
+    pub(crate) fn flips_pending(&self) -> bool {
+        let own = std::ptr::from_ref(self) as usize;
+        FLIPS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|f| f.heap == own)
+    }
+
     /// Makes the slots whose new view's upload has run
     /// ([`HostHeap::texture_slot_flip`]); returns how many.
     pub(crate) fn texture_slots_flip(&self) -> usize {
@@ -4609,8 +4618,11 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        unordered = *unordered,
+                        frame = crate::frame::current(),
+                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}, all {:?}",
+                        &desc[..10],
+                        &desc[..]
                     );
                 }
                 return None;

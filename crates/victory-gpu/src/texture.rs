@@ -1038,11 +1038,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
+        list.defer_host(move || {
+            noted.note_held();
+            #[cfg(feature = "diagnostics")]
+            noted.note_census();
+        });
         return;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
+        #[cfg(feature = "diagnostics")]
+        staging.note_census();
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
@@ -1289,6 +1295,25 @@ impl Staging {
     fn note_held(&self) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+    }
+
+    /// Diagnostics (`VICTORY_STALE_CENSUS`): the hash of the bytes title
+    /// memory holds as the upload of this staging buffer goes to the card, for
+    /// every texture whatever its guards say (`holds` is set only for a texture
+    /// the guards cannot watch), kept by host copy ([`differs_from_upload`]).
+    #[cfg(feature = "diagnostics")]
+    fn note_census(&self) {
+        if crate::resource::stale_census_mode() == 0 {
+            return;
+        }
+        let hash = with_read(self.read, |read| (crate::host::read_there(self.memory, read) != 0).then(|| digest(read)));
+        if let Some(hash) = hash {
+            CENSUS_HELD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Default::default)
+                .insert(self.serial, (self.first, hash));
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1806,6 +1831,38 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         digest(read) == held
     })
 }
+
+/// Diagnostics (`VICTORY_STALE_CENSUS`, [`crate::resource::stale_census`]):
+/// whether the bytes of title memory a title texture's host copy was filled
+/// from (all of them, as [`unchanged`] reads them) are the bytes memory
+/// holds now. `None`: the host copy holds nothing of memory (never filled
+/// from it) or the memory cannot be read; else whether they differ, and how
+/// many bytes were compared.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn differs_from_upload(resource: This) -> Option<(bool, u64)> {
+    let copy = crate::resource::made_copy(resource)?;
+    let held = CENSUS_HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&copy.serial).copied());
+    let (from, held) = match held {
+        Some(held) => held,
+        None => (*copy.holds.lock().unwrap_or_else(|e| e.into_inner()))?,
+    };
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    let layout = &layout.planes[0].layout;
+    let size = layout.bytes_from(from) as usize;
+    with_read(size, |read| {
+        if crate::host::read_there(memory, read) == 0 {
+            return None;
+        }
+        Some((digest(read) != held, size as u64))
+    })
+}
+
+/// Diagnostics: for each host copy (by [`crate::resource::HostTexture::serial`]),
+/// the first level and the hash of the bytes title memory held as its last
+/// upload went to the card ([`Staging::note_census`]).
+#[cfg(feature = "diagnostics")]
+static CENSUS_HELD: Mutex<Option<HashMap<u64, (u32, Digest)>>> = Mutex::new(None);
 
 /// Where the levels from `first` on of a title texture are: address and
 /// bytes.

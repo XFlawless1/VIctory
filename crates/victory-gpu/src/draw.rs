@@ -149,6 +149,42 @@ const BAKE_AHEAD: [u64; 2] = [12, 2];
 /// until something is new, the next bakes of the frame need no pass.
 static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a draw is also taken for one of the title's bakes by what it
+/// draws into ([`State::looks_like_bake`]: no depth, four targets or more,
+/// the first square and 512 texels across), not by its pixel shader alone
+/// (`VICTORY_BAKE_DETECT=1`; off: [`BAKE_PIXEL_SHADERS`] only). The title's
+/// decoration bake has sixteen blend programs and as many mesh programs; the
+/// list names four.
+fn bake_detect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_DETECT").is_some_and(|v| v == "1"))
+}
+
+/// Whether the pass before a draw of the bake uploads again, into the list of
+/// the draw, a texture made in the last second whose host copy holds the
+/// bytes of its memory (`VICTORY_BAKE_FRESH=1`; off: as before).
+fn bake_fresh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_FRESH").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: slots the pass before a draw of the bake found made in
+/// the last second, with a host copy that holds the bytes of its memory
+/// ([`bake_fresh`]).
+static BAKE_FRESH_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the pass before a draw of the bake settles the flights in the air
+/// and flips the slots that wait for them, if there are any
+/// ([`State::bake_flush`]; `VICTORY_BAKE_SETTLE=1`; off: as before).
+fn bake_settle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SETTLE").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: settles made for a draw of the bake, and the slots
+/// flipped by them.
+static BAKE_SETTLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
@@ -2095,6 +2131,93 @@ impl State {
         Some(gpu)
     }
 
+    /// Whether the draw being bound looks like one of the title's bakes
+    /// by its targets: no depth, four targets or more, the first square
+    /// and 512 texels or more across (the five 2048x2048 targets of its
+    /// decoration bake, whichever of its sixteen blend programs and
+    /// its mesh programs it runs).
+    fn looks_like_bake(&self) -> bool {
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
+    /// Diagnostics: draws that look like the title's bakes (no depth, four
+    /// targets or more, the first square and 512 texels or more across: the
+    /// five 2048x2048 targets of its decoration bake) by their shaders, and
+    /// whether [`BAKE_PIXEL_SHADERS`] holds the pixel shader of each. The
+    /// first of each kind is logged with its frame, then the counts at powers
+    /// of two: `a draw that looks like a bake`.
+    #[cfg(feature = "diagnostics")]
+    fn bake_census(&self, p: &HostPipeline) {
+        if !self.looks_like_bake() {
+            return;
+        }
+        crate::capture::bake_seen();
+        let ours = p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let key = p.stages.iter().map(|s| s.shader.hash.as_str().chars().take(16).collect::<String>()).collect::<Vec<_>>().join("+");
+        static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let count = seen.get_or_insert_with(Default::default).entry(key.clone()).or_insert(0);
+        *count += 1;
+        if count.is_power_of_two() {
+            let (w, h, f) = self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .unwrap_or_default();
+            tracing::info!(
+                frame = crate::frame::current(),
+                shaders = key.as_str(),
+                in_bake_list = ours,
+                draws = *count,
+                targets = self.targets.len(),
+                first_target = format_args!("{w}x{h} f{f}"),
+                "a draw that looks like a bake"
+            );
+        }
+    }
+
+    /// Diagnostics (`VICTORY_STALE_AT_BAKE`): the census of stale textures
+    /// before the pass of a draw of the bake.
+    #[cfg(feature = "diagnostics")]
+    fn bake_stale(bake: bool, frame: u64) {
+        if bake {
+            crate::resource::stale_at_bake(frame);
+        }
+    }
+
+    /// Before a draw of the bake is recorded (`VICTORY_BAKE_SETTLE=1`): slots
+    /// that show the neutral texture, or what they showed before, until
+    /// submissions in flight have run ([`crate::descriptor::host::show_after`],
+    /// [`crate::descriptor::host::show_new_later`]) show their texture
+    /// at the next pass that flips them, which may be after the card has run
+    /// the draw: the bake samples the stand-in and keeps it for good. If there
+    /// are such slots, the flights are settled and the slots flipped now. The
+    /// uploads of this draw's own pass are recorded into its list ahead of the
+    /// draw, and are run by then.
+    fn bake_flush(host: &crate::descriptor::host::HostHeap) {
+        if !bake_settle() || !host.flips_pending() {
+            return;
+        }
+        crate::host::settle_for_fence();
+        let flipped = host.texture_slots_flip();
+        let n = BAKE_SETTLES[0].fetch_add(1, Ordering::Relaxed) + 1;
+        BAKE_SETTLES[1].fetch_add(flipped as u64, Ordering::Relaxed);
+        if n.is_power_of_two() {
+            tracing::info!(
+                frame = crate::frame::current(),
+                settles = n,
+                slots_flipped = BAKE_SETTLES[1].load(Ordering::Relaxed),
+                "flights settled and slots shown before a draw of the title's decoration bake (VICTORY_BAKE_SETTLE=0: not)"
+            );
+        }
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -2107,8 +2230,11 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.bake_census(p);
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && (p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()))
+                || (bake_detect() && self.looks_like_bake()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -2143,6 +2269,7 @@ impl State {
         if bake && !first && bake_exact() {
             let (writes, noted) = host.texture_news();
             if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
+                Self::bake_flush(host);
                 return;
             }
         }
@@ -2156,6 +2283,7 @@ impl State {
                 due_at_the_last_pass = due,
                 uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
                 made_due_by_page_writes = crate::descriptor::host::BAKE_WOKEN.load(Ordering::Relaxed),
+                fresh_slots_held = BAKE_FRESH_HELD.load(Ordering::Relaxed),
                 "a draw of the title's decoration bake: textures picked by index are uploaded first (VICTORY_BAKE_TEXTURES_MS=0: not)"
             );
         }
@@ -2185,12 +2313,15 @@ impl State {
             }
         }
         let began = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        Self::bake_stale(bake, frame);
         PASS_BUDGET.set(Some(budget));
         crate::texture::BAKING.set(bake && bake_exact());
         self.heap_textures(list, heap, host);
         crate::texture::BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
+            Self::bake_flush(host);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
@@ -2654,7 +2785,20 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            let same = !tabled && crate::texture::unchanged(resource, first);
+            // (For a draw of the bake, a texture made in the last second is
+            // uploaded again into this list whatever the bytes say
+            // (`VICTORY_BAKE_FRESH=1`): its upload may sit in a list that
+            // has not run, or has not been sent, and the draw would sample
+            // the card's memory as it is.)
+            let held = !tabled && crate::texture::unchanged(resource, first);
+            // (Counted whichever way the switch is: the slots a bake pass
+            // finds made in the last second whose host copy holds the bytes
+            // of their memory, which a list before this one may not have run.)
+            let fresh_held = held && baking && texture.is_some_and(crate::pool::fresh);
+            if fresh_held {
+                BAKE_FRESH_HELD.fetch_add(1, Ordering::Relaxed);
+            }
+            let same = held && !(fresh_held && bake_fresh());
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {

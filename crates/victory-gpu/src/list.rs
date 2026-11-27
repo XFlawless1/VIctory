@@ -1134,6 +1134,8 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_copied_into(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
