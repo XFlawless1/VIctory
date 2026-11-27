@@ -312,3 +312,34 @@ shows none either, so what it measured between its two runs is not this fix).
 device removal; the retry never ran in the game here, so what a failed detiling does to the picture was not seen, and the
 only evidence of the fix is the tests (`texture::detile_retry`, `texture::ahead::tests`, `Layout::check_detile`'s). With it
 on the world frame median of `tx_all1` was 44.5 ms against 47.3 and 47.9 (see #454: one run each).
+
+## Belobug #424: the states of the buffers lists use directly (2026-11-27)
+
+`VICTORY_BUFFER_STATES` (off; `=1` on; `=0`: as before, no state tracked, no barrier recorded, no allocation: the lists are
+what they were). Ported from Belobug/VIctory-Belobug-AMD #424 (by its author; its issue #350), GPL-3.0-or-later;
+`host/buffers.rs` is its module, the rest by hand (`host.rs`, `draw.rs`, `indirect.rs`, `host/place.rs`). Each host list
+tracks the state of the card-side buffers it binds directly (root views of a draw or dispatch, vertex and index buffers,
+the source of an indirect clamp) and of those it copies into or out of. `place_copy` and `place_source` bring their
+buffers back to the common state after the copy: a `CopyBufferRegion` promotes its destination from the common state to
+`COPY_DEST`, nothing took it out, and the compare list `plan.check` of the same submission read it as a root shader
+resource (id 538 of the debug layer, "COPY_DEST promoted from COMMON is invalid for use as a root shader resource",
+#350). A list's prelude brings a buffer an earlier list of the same `ExecuteCommandLists` left in another state back to
+common, and the compare list moves what is left in a write state to a read state. Not taken: the PR's debug-layer test
+(`copies_in_place_leave_their_buffers_to_root_views`, ignored; it needs the layer).
+
+**The D3D12 debug layer is not on this PC** (no `d3d12SDKLayers.dll` in `System32`, `SysWOW64` or the driver store: the
+Windows optional feature "Graphics Tools" is not installed, and installing it was not asked for), so error 538 cannot be
+counted before and after here. What is checked instead is what the host list records: `a_copy_into_a_host_copy_is_left_promoted_unless_the_states_are_tracked`
+(`host::place::tests`) shows that without the switch a `place_copy` into a host copy in the card's memory tracks nothing
+and records nothing that takes the buffer out of `COPY_DEST`, and with it the buffer ends in the common state;
+`place_copy_restores_buffer_to_common_and_runs_cleanly` and the five state-machine tests of `host::buffers` are the PR's.
+Whether #350's device loss has anything to do with it is not known (its author says it was not this).
+
+**Frame time.** `tx_all1` (this switch on, with the three other ports) 44.5 ms median in the world, against 47.9 ms for
+`tx_cache1` and 47.3 for `tx_old1` (neither tracks buffer states): one run each, whose spread is as large as the
+differences, so no cost shows and no gain; the pairs of runs each side that were asked for were not made (the machine lock
+was not free, and the time box). The recording threads do the extra work only where a draw binds a root view, a vertex or
+index buffer of a host copy directly, and for `place_copy` and indirect clamps (a hash lookup and a lock a call); the log of
+`tx_all1` has no device removal. Left off by default: nothing here shows the switch to help (error 538 could not be
+counted), and a wrong state in a barrier is a way to break a picture; what would justify turning it on is a run with
+`VICTORY_D3D12_DEBUG=1` on a PC with Graphics Tools that shows 538 gone and the picture unchanged.

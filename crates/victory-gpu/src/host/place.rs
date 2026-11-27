@@ -214,6 +214,18 @@ impl HostList {
             None => return false,
         };
         let at = to.offset(dst as u64);
+        // (`VICTORY_BUFFER_STATES`: the buffer between is made before anything
+        // of the list's state changes; none of the barriers below is
+        // recorded without it, nor is the buffer made here.)
+        let between = match &own {
+            Some(from) if super::buffers::on() && from.buffer.as_raw() == to.buffer.as_raw() => {
+                let Some(between) = self.between(host, len as u64) else {
+                    return false;
+                };
+                Some(between)
+            }
+            _ => None,
+        };
         // What the title's CPU wrote around and under it so far goes first.
         to.refresh(self, dst as u64, len as u64);
         // SAFETY (both): an open list; live buffers (the list holds the
@@ -224,23 +236,61 @@ impl HostList {
                 from.refresh(self, src as u64, len as u64);
                 let offset = from.offset(src as u64);
                 if from.buffer.as_raw() == to.buffer.as_raw() {
-                    let Some(between) = self.between(host, len as u64) else {
+                    let Some(between) = between.or_else(|| self.between(host, len as u64)) else {
                         return false;
                     };
+                    // The copy out reads the buffer, then the copy back writes
+                    // it: out of the state the first left it in, into the
+                    // second's, and back to the common state at the end, for
+                    // the root views that follow.
+                    self.buffer_read(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    // SAFETY: open list; live buffers; ranges inside them.
                     unsafe {
                         self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        let mut mid = vec![transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+                        if let Some(b) = self.buffer_write_barrier(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST) {
+                            mid.push(b);
+                        }
+                        self.list.ResourceBarrier(&mid);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
+                        if let Some(b) = self.buffer_common_barrier(&to.buffer) {
+                            self.list.ResourceBarrier(&[b]);
+                        }
                     }
                 } else {
-                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
+                    // Out of the state an earlier read of the list left the
+                    // source in, into the destination's copy state, and both
+                    // back to the common state.
+                    let mut pre = Vec::new();
+                    pre.extend(self.buffer_read_barrier(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                    pre.extend(self.buffer_write_barrier(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST));
+                    let mut post = Vec::new();
+                    post.extend(self.buffer_common_barrier(&to.buffer));
+                    post.extend(self.buffer_common_barrier(&from.buffer));
+                    // SAFETY: open list; live buffers; ranges inside them.
+                    unsafe {
+                        if !pre.is_empty() {
+                            self.list.ResourceBarrier(&pre);
+                        }
+                        self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64);
+                        if !post.is_empty() {
+                            self.list.ResourceBarrier(&post);
+                        }
+                    }
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
-            (None, Some((from, offset, _))) => unsafe {
-                self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
-            },
+            (None, Some((from, offset, _))) => {
+                self.buffer_write(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+                // SAFETY: open list; live buffers; ranges inside them.
+                unsafe {
+                    self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
+                    if let Some(b) = self.buffer_common_barrier(&to.buffer) {
+                        self.list.ResourceBarrier(&[b]);
+                    }
+                }
+            }
             (None, None) => return false,
         }
         unsafe { wait_for_all(host, &self.list) };
@@ -273,10 +323,15 @@ impl HostList {
         from.refresh(self, src as u64, len as u64);
         STATS[3].fetch_add(1, Ordering::Relaxed);
         // SAFETY: an open list; live buffers, ranges inside them.
+        unsafe { wait_for_all(host, &self.list) };
+        self.buffer_read(&from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
-            wait_for_all(host, &self.list);
             self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
-            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            // (And the source back to the common state, in the same call.)
+            let mut post = vec![transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+            post.extend(self.buffer_common_barrier(&from.buffer));
+            self.list.ResourceBarrier(&post);
             wait_for_all(host, &self.list);
         }
         Some(between)
@@ -293,6 +348,129 @@ impl HostList {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::host::buffers;
+
+    /// Fresh title memory of `LEN` bytes with a host copy of its own (not in
+    /// place), and memory to copy from. `None` without a host GPU.
+    fn copy_between() -> Option<(&'static mut [u8], &'static mut [u8], usize, usize, std::sync::Arc<Shadow>)> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const LEN: usize = 64 << 10;
+        host()?;
+        // SAFETY: fresh private memory for this test.
+        let dst_ptr = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>() };
+        // SAFETY: as above.
+        let src_ptr = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>() };
+        assert!(!dst_ptr.is_null() && !src_ptr.is_null());
+        // SAFETY: `LEN` bytes just committed.
+        let (dst_mem, src_mem) = unsafe {
+            (std::slice::from_raw_parts_mut(dst_ptr, LEN), std::slice::from_raw_parts_mut(src_ptr, LEN))
+        };
+        for (i, b) in src_mem[..256].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3).wrapping_add(7);
+        }
+        crate::shadow::register(0x350_0001 + dst_ptr as usize, dst_ptr as u64, LEN as u64);
+        let shadow = crate::shadow::find(dst_ptr as u64, 64)?;
+        (!shadow.in_place()).then_some((dst_mem, src_mem, dst_ptr as usize, src_ptr as usize, shadow))
+    }
+
+    /// Issue #350 as the code has it without `VICTORY_BUFFER_STATES` (what
+    /// Belobug/VIctory-Belobug-AMD #424 found): a copy into a host copy that
+    /// lives in the card's memory is a `CopyBufferRegion`, which promotes the
+    /// buffer from the common state to the copy state, and nothing the list
+    /// does after it takes the buffer out of that state: no state is tracked
+    /// and no barrier records the way back, so the root shader resource of
+    /// the compare that follows the lists in the same submission
+    /// (`plan.check`, id 538 of the debug layer) reads a buffer that D3D12
+    /// still has as `COPY_DEST` until that `ExecuteCommandLists` ends.
+    /// (Tracked, the same copy ends in the common state.)
+    #[test]
+    fn a_copy_into_a_host_copy_is_left_promoted_unless_the_states_are_tracked() {
+        for tracked in [false, true] {
+            buffers::FORCED.with(|f| f.set(Some(tracked)));
+            let Some((_, _, dst, src, shadow)) = copy_between() else { return };
+            let list = host().unwrap().new_list().expect("host list");
+            assert!(list.place_copy(dst, src, 256));
+            let key = shadow.buffer.as_raw() as usize;
+            let states = list.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+            if tracked {
+                let entry = states.get(&key).expect("the destination is tracked");
+                assert_eq!(entry.track.current, buffers::COMMON, "back in the common state, for the root view after it");
+                assert!(entry.track.needs_common);
+            } else {
+                assert!(states.is_empty(), "as before: nothing tracked, nothing recorded to take it out of COPY_DEST");
+            }
+            drop(states);
+            list.close();
+            buffers::FORCED.with(|f| f.set(None));
+        }
+    }
+
+    /// `place_copy` (from upload scratch, after an earlier read, and within
+    /// the same shadow buffer) must leave the destination shadow buffer in
+    /// `COMMON` so later root views and `plan.check` in the same
+    /// `ExecuteCommandLists` call can promote it without D3D12 ID 538.
+    /// (Belobug/VIctory-Belobug-AMD #424's test; tracked, as that PR has it.)
+    #[test]
+    fn place_copy_restores_buffer_to_common_and_runs_cleanly() {
+        buffers::FORCED.with(|f| f.set(Some(true)));
+        let Some((dst_mem, src_mem, dst, src, shadow)) = copy_between() else {
+            buffers::FORCED.with(|f| f.set(None));
+            return;
+        };
+        let host = host().unwrap();
+        let key = shadow.buffer.as_raw() as usize;
+        let current = |list: &HostList| {
+            let states = list.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = states.get(&key).expect("tracked destination buffer");
+            (entry.track.current, entry.track.needs_common, entry.track.promoted_read)
+        };
+        let list = host.new_list().expect("host list");
+        // 1. Fresh upload-scratch -> shadow copy leaves buffer in COMMON.
+        assert!(list.place_copy(dst, src, 256));
+        assert_eq!(current(&list), (buffers::COMMON, true, false));
+        // 2. Subsequent compute root SRV read promotes COMMON -> NON_PIXEL_SRV.
+        list.buffer_read(&shadow.buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        assert_eq!(current(&list), (buffers::NON_PIXEL_SRV, true, true));
+        // 3. Second `place_copy` after the read transitions NON_PIXEL_SRV -> COPY_DEST -> COMMON.
+        assert!(list.place_copy(dst + 512, src, 256));
+        assert_eq!(current(&list).0, buffers::COMMON);
+        // 4. Same-buffer copy (`from == to`) transitions COPY_SOURCE -> COPY_DEST -> COMMON.
+        assert!(shadow.written());
+        assert!(list.place_copy(dst + 1024, dst, 256));
+        assert_eq!(current(&list).0, buffers::COMMON);
+        list.close();
+        host.execute_own(&list);
+        assert_eq!(&dst_mem[..256], &src_mem[..256]);
+        assert_eq!(&dst_mem[512..768], &src_mem[..256]);
+        assert_eq!(&dst_mem[1024..1280], &src_mem[..256]);
+
+        // 5. Cross-list handoff in one submission: list_a leaves `shadow.buffer`
+        // read-promoted (`NON_PIXEL_SRV`), and list_b runs `place_copy` into it.
+        // `prelude_buffer_barriers` must bridge `NON_PIXEL_SRV -> COMMON` before list_b.
+        let list_a = host.new_list().expect("host list a");
+        list_a.buffer_read(&shadow.buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        let list_b = host.new_list().expect("host list b");
+        assert!(list_b.place_copy(dst + 2048, src, 256));
+        let mut live = buffers::LiveBuffers::new();
+        assert!(list_a.prelude_buffer_barriers(&mut live).is_empty());
+        assert_eq!(
+            live.get(&key).copied(),
+            Some(buffers::LiveState { state: buffers::NON_PIXEL_SRV, promoted_read: true })
+        );
+        let bridge = list_b.prelude_buffer_barriers(&mut live);
+        assert_eq!(bridge.len(), 1);
+        assert!(!live.contains_key(&key));
+        list_a.close();
+        list_b.close();
+        host.execute(&[&list_a, &list_b]);
+        buffers::FORCED.with(|f| f.set(None));
+        assert_eq!(&dst_mem[2048..2304], &src_mem[..256]);
+        if let Some(msg) = host.log_messages() {
+            panic!("D3D12 debug layer reported an error: {msg}");
+        }
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
