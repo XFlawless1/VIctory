@@ -1528,18 +1528,20 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-/// `VICTORY_WAVE_ZERO_MASK=0`: a lane mask that is identically empty is read through the
-/// ballot of its lanes as before, and a mask that a lane branch copies from one written in the
-/// entry block is ballotted where it was made, not where it was copied
-/// ([`Lower::mask_dword`]). Ported from stellarr-studio/kelvaroq patches 0033 and 0047
-/// (GPL-3.0-or-later). Part of the translation: the shader cache keys on it.
+/// `VICTORY_WAVE_ZERO_MASK=1` (OFF by default): a lane mask that is identically empty reads as 0
+/// in both dwords, and a mask that a lane branch copies from one written in the entry block is
+/// ballotted where it was made, not where it was copied ([`Lower::mask_dword`]); off, an empty
+/// mask is read through the ballot of its lanes as before. Ported from stellarr-studio/kelvaroq
+/// patches 0033 and 0047 (GPL-3.0-or-later). Off because it changes 9 programs of the pack (the
+/// tiled cascade shadow rasterizers among them) with no benefit shown and no reference check.
+/// Part of the translation: the shader cache keys on it.
 fn zero_mask_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_ZERO_MASK.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_some_and(|v| v != "0"))
 }
 
 #[cfg(test)]

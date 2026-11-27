@@ -37,7 +37,7 @@ pub mod structure;
 /// 3 = console threads of 2-D and 3-D groups of more than one host wave come from the wave
 /// counter (`VICTORY_THREAD_TICKETS`, Belobug PR #442): 4 programs of the pack; 4 = an empty lane
 /// mask reads as 0 and a mask copied in a lane branch from one made in the entry block is
-/// ballotted there (`VICTORY_WAVE_ZERO_MASK`, kelvaroq patches 0033 and 0047): 9 programs of the pack
+/// ballotted there (`VICTORY_WAVE_ZERO_MASK=1`, off by default, kelvaroq patches 0033 and 0047): 9 programs of the pack
 /// (the tiled cascade shadow rasterizers `CS_ShadowRenderTiledMisc*` and `sr_tracing:CS_RayPrePass_Alpha`).
 pub const TRANSLATOR_VERSION: u32 = 4;
 

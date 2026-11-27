@@ -329,7 +329,7 @@ build): the PR's conditions are narrow (one console wave, no LDS, nothing but pl
 instructions, nested loops with one entry and one exit), and no program of the pack meets them here.
 
 **An empty lane mask reads as 0, and a copy of an entry mask is ballotted at its source (kelvaroq 0033 and the mask pieces of
-0047; `VICTORY_WAVE_ZERO_MASK=0` is the old behaviour; `TRANSLATOR_VERSION` 4).** In a console wave64 program run as two host
+0047; `VICTORY_WAVE_ZERO_MASK=1` turns it on, it is OFF by default after the merge (9 programs change, among them the cascade shadow rasterizers, with no benefit shown and no reference check); `TRANSLATOR_VERSION` 4).** In a console wave64 program run as two host
 waves, a mask read as a number needs both waves to ballot it where every lane runs. A mask that is identically empty
 (`s_xor_b64 s[14:15], exec, exec`) now reads as 0 in both dwords whatever the other wave does (0033; `Bool::FALSE`), and a
 mask a lane branch copies (`s_mov_b64`, or `s_and_b64` / `s_or_b64` of one value with itself) from one written in the entry
