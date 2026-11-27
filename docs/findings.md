@@ -1015,3 +1015,42 @@ title's resources 0x227876b7620, 0x2273b492be0, 0x227816404f0 and 0x22984a16c80.
 (Marvisak/VIctory ff474638, cool_fox f4b48ad) is not it: it concerns `alphaResolve:CS_AlphTransmissionPrefilterMip`, and
 its port on `port/upstream-translator` changes none of the 25,689 translations of the title's pack. Tests of this tree:
 413 in `victory-gpu` (diagnostics, lib), 34 ignored, as at e090f1a7 (none added).
+
+**Six whole runs, off and on (A B A B A B, 240 s each, prison cell; then one of 360 s each way).** `VICTORY_CB_BASE=0` (a) against `=1` (b), the
+same binary, no probes, world = frame lines of 4,400-4,500 draws:
+
+| run | a1 | a2 | a3 | b1 | b2 | b3 | a 360 s | b 360 s |
+|---|---|---|---|---|---|---|---|---|
+| frame ms, median of world lines | 43.3 | 42.8 | 43.2 | 42.0 | 38.3 | 37.5 | 39.5 (last 30 lines: 39.3) | 38.3 (last 30: 37.7) |
+| list-call ms a frame, all threads | 102.8 | 101.6 | 103.6 | 92.6 | 87.1 | 84.7 | 95.4 (last 30: 95.1) | 85.8 (last 30: 83.8) |
+
+Device removals and `ERROR` lines: none in the eight. Frame time off 43.1 ms (spread 0.5), on 39.3 ms (spread 4.5): -3.8 ms, but part of
+that is **when the world settles**: in every off run the frame time falls by about 4 ms some 20-60 s after the world begins (the 360 s
+run: 44 ms at first, 39-40 from about frame 5,000 on), and the runs with the switch on were at the lower figure from the first world
+frames I looked at (frame 4,100). Settled against settled (the last 30 world lines of the 360 s runs): 39.3 -> 37.7 ms (-1.6 ms, 4 %) and
+95.1 -> 83.8 ms in list calls (-12 %); with the in-run pairs above (-2.2 ms), **the host side is worth about 1.6-2.2 ms of a settled frame**.
+Why the runs with the switch on are ahead in that settling is not known.
+
+**The picture, statistically** (captures of frames 4,100-5,500 of the six runs, 960x540, mean absolute difference per pixel over R, G, B,
+0-255, same frame number): same setting 6.5 (median over 23 frames), off against on 11.1. Not a fair test: the captured frame number is
+another moment of the scene in each run. Matching each frame to the nearest frame of the other run: off against off 5.9 (a1, a2, a3),
+on against on 3.2, off against on 7.9 (6.3 and off against off 5.3 without a2, which is 6-12 from every other run). So off against on is
+**larger than on against on, and a little larger than off against off**: the runs with the switch on agree with each other better than
+those without. What differs is the state of the scene, not a surface: the cell's left wall (mean luma of x 0-150, y 120-420) is 34-37
+in a1 (until frame 4,500) and a2, about 50 in a1 (later), la and b1, 61-62 in b2, b3, the long b run and a3 (late), so the runs without
+the switch pass through darker states (a dark shadow on the wall, textures not yet in: the poster at the right is dithered at frame 4,500
+of a1 and a3, crisp in b2 and, at frame 5,500, in a3) that none of the four runs with it showed (the states of b are a subset of a's).
+Mean colour of the world frames: off R 70-77 (a3 80.6 at frame 5,500), on R 78-83. Looked at by eye (a1 and b2 and a3 at 4,500, a3 at 5,500,
+a and b of the long runs at 6,300, the diner at 2,300 and 2,600, both ways): no black, NaN or wrong-coloured surface in any of the ten, with and
+without the switch; skin, hair and UI text as they should be; blocky or dithered texture detail in some frames without the switch
+(the background of a1 at 2,300, a sleeve of a3 at 2,600, the posters at 4,500) and in none of the four with it; the confetti face was
+not seen in any of them (neither off nor on). Mean differences cannot show a local error of a few pixels, and the replay did not work, so this is no proof of
+exactness; it shows no sign of an error.
+
+**The first run with the switch on** (`run t1`, the first of its kind on this PC, translations and the driver's compilation of the new
+DXIL both cold; the logs): 1,724 translations on the way (the cache then served 1,900-2,800 shaders and missed 0-113 in the next runs), the
+first world frames 10.3 s (!) a frame, 13 frame lines over a second and 16 over 100 ms (worst 10.3 s), the world reached at 127 s against
+90-106 s; the second run (`t2`) had 1 line over 100 ms (worst 1.7 s) and `t3` none over a second. The run before it with the switch off
+was a cold cache too (2,860 translations) but its worst frame was 1.1 s: its DXIL was in the driver's cache. So the price of turning the
+switch on is about a minute of stalls in the first run (the title waits up to 10 s for each pipeline: `VICTORY_PIPELINE_WAIT_MS`), nothing
+in the second. `victory shaders` and `victory warm` (translate and make the pipelines beforehand) would take it away; not tried.
