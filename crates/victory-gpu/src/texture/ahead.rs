@@ -380,16 +380,22 @@ impl Worker {
                     jobs.push(job);
                 }
             }
-            value += 1;
-            let result = self.copy(&jobs, value);
-            settle(jobs, result, safe());
+            // A texture whose detiling failed is not copied (it was copied
+            // part converted, and counted as uploaded): it is the lists'.
+            // Other jobs of the batch go on (`VICTORY_DETILE_RETRY`).
+            let failed = refresh_all(&mut jobs);
+            if !failed.is_empty() {
+                finish(failed, false);
+            }
+            if !jobs.is_empty() {
+                value += 1;
+                let result = self.copy(&jobs, value);
+                settle(jobs, result, safe());
+            }
         }
     }
 
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
-        }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
@@ -406,6 +412,17 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+/// Refreshes the staging buffer of each job (what the jobs' copies take), and
+/// takes the jobs whose last conversion failed out of `jobs` (a staging
+/// buffer's `Last::incomplete` is set only with `VICTORY_DETILE_RETRY`).
+fn refresh_all(jobs: &mut Vec<Arc<Job>>) -> Vec<Arc<Job>> {
+    jobs.extract_if(.., |job| {
+        job.staging.refresh();
+        job.staging.last.lock().unwrap_or_else(|e| e.into_inner()).incomplete
+    })
+    .collect()
 }
 
 impl Job {
@@ -702,6 +719,76 @@ mod tests {
             assert!(seen == expected.as_slice(), "level 0's blocks");
             back.Unmap(0, None);
         }
+    }
+
+    /// A detiling that finds the title's memory short of what the layout
+    /// needs (a mip out of its bounds): with `VICTORY_DETILE_RETRY` (`retry`)
+    /// it says so, notes nothing as filled, and leaves the staging buffer as
+    /// it was; as before it counted as done, the staging buffer dirty, to be
+    /// uploaded.
+    #[test]
+    fn a_detiling_that_failed_is_not_counted_and_the_buffer_is_left_alone() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((texture, _copy)) = placed(0x61) else { return };
+        let Some(Taken::New(job)) = claim_as(texture, 0, u64::MAX, true) else { panic!("not taken") };
+        let staging = &job.staging;
+        let (data, len) = (staging.data, staging.bytes as usize);
+        // SAFETY (both): the mapped staging buffer, whose bytes nothing else
+        // touches here, while `detile_as` is not running.
+        let fill = |b: u8| unsafe { std::ptr::write_bytes(data, b, len) };
+        let held = || unsafe { std::slice::from_raw_parts(data.cast_const(), len) };
+        let size = staging.layout.size as usize;
+        let short = vec![0x42u8; size - 1];
+        for retry in [false, true] {
+            fill(0xa1);
+            staging.dirty.store(false, Relaxed);
+            let done = staging.detile_as(retry, &short);
+            if retry {
+                assert!(!done, "it did not detile");
+                assert!(!staging.dirty.load(Relaxed), "nothing to upload");
+                assert!(held().iter().all(|&b| b == 0xa1), "nothing written");
+            } else {
+                assert!(done, "as before: counted done");
+                assert!(staging.dirty.load(Relaxed));
+            }
+        }
+        // Memory enough: detiled, and dirty, whichever way.
+        let whole = vec![0x42u8; size];
+        for retry in [false, true] {
+            fill(0xa1);
+            staging.dirty.store(false, Relaxed);
+            assert!(staging.detile_as(retry, &whole));
+            assert!(staging.dirty.load(Relaxed));
+            assert!(held().iter().any(|&b| b == 0x42), "written");
+        }
+        // (Not sent: off the list of those on their way, as a copy that did not run.)
+        finish(vec![job.clone()], false);
+    }
+
+    /// The worker takes a job whose staging buffer's last conversion failed
+    /// out of its batch: that texture is the lists', and the others go on.
+    #[test]
+    fn a_job_whose_conversion_failed_leaves_its_batch() {
+        let (Some((failing, failing_copy)), Some((fine, fine_copy))) = (placed(0x71), placed(0x72)) else { return };
+        let Some(Taken::New(bad)) = claim_as(failing, 0, u64::MAX, true) else { panic!("not taken") };
+        let Some(Taken::New(good)) = claim_as(fine, 0, u64::MAX, true) else { panic!("not taken") };
+        {
+            // A refresh that leaves the staging buffer incomplete (a once
+            // texture that has a digest is not looked at again).
+            let mut last = bad.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+            last.incomplete = true;
+            last.hash = Some(crate::texture::digest(&[1, 2, 3]));
+        }
+        let mut jobs = vec![bad.clone(), good.clone()];
+        let failed = refresh_all(&mut jobs);
+        assert!(failed.len() == 1 && Arc::ptr_eq(&failed[0], &bad));
+        assert!(jobs.len() == 1 && Arc::ptr_eq(&jobs[0], &good));
+        assert!(!good.staging.last.lock().unwrap_or_else(|e| e.into_inner()).incomplete, "the other one was converted");
+        finish(failed, false);
+        assert!(!there(failing) && failing_copy.ahead.load(Acquire) == LISTED);
+        // (The other one's copy is not run here either.)
+        settle(jobs, Ok(()), true);
+        assert!(there(fine) && fine_copy.ahead.load(Acquire) == DONE);
     }
 
     /// One on its way: the wait ends after its `then` calls have run, and a

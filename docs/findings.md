@@ -266,3 +266,49 @@ not run", no "timed out", no device removal in any of the three. World frame med
 44.5 (`tx_all1`); earlier runs of the base tree today were 41.0 to 47.6, so that is the PC's spread from run to run: no sign
 of a cost, and none of a gain. Uploads ahead 55,000 / 65,000 / 60,000 (the line is logged every 5,000), "slots shown after
 their upload ... not shown any more by then" 371 / 402 / 428. What was not seen: a copy that did not run, in the game.
+
+## Belobug #470: read-only opens through the file cache, and a failed detiling retried (2026-11-27)
+
+Ported from Belobug/VIctory-Belobug-AMD #470 (by its author; it takes its two halves from avatarmanz/VIctory-7900XTX
+#423 and #419), GPL-3.0-or-later, by hand where the diff did not apply (`texture.rs`, `ahead.rs`).
+
+**`VICTORY_FILE_CACHE`** (off; `=1` on; `=0` keeps the title's `FILE_FLAG_NO_BUFFERING`, as before). In
+`victory-hle`'s `files.rs`: an open whose access is exactly `GENERIC_READ` and is not overlapped loses the flag on the
+way to the host's `CreateFileW`/`CreateFileA`, so that reads go through the system file cache (a buffered handle also takes
+reads that are not aligned); overlapped opens, opens with write access and `CreateFile2` (Bink) are as before. The log
+names the first 8 unbuffered opens and every 256th, with `cached=true` if the flag was dropped. The cache is PC memory
+(standby pages, given back when something asks for them); the PR has it on, this tree off until it is shown to help here.
+
+**Measured here** (RTX 5080, Samsung 990 PRO NVMe, 31 GB of RAM of which the title and the PC leave 0.5 to 1.5 GB;
+`tx_old1` against `tx_cache1`, one run each, not the two each that were asked for: the machine lock was not free): the log
+says the switch was active (`cached=true` on the title's unbuffered opens, `access=0x80000000 flags=0x20000000`; only 8 opens
+were named: the log names the first 8 and every 256th, so fewer than 256 were unbuffered). First frame-rate line with 1,000+ draws: 86.2 s after the
+first log line without, 83.7 s with it (eight earlier runs of the base tree today, without it: 77.9 to 88.8 s). Five-second lines before
+the world under 15 fps: 1 and 1, the worst 376 and 411 ms a frame, as in every earlier run. The PC's available memory (free
+plus standby; sampled every 10 s) at its lowest 982 and 502 MB, at the end of the run 1,301 and 1,360 MB, the zero list 56 and
+56 MB at the end; the standby list's largest 11.5 and 6.0 GB, which probably says more of what ran on the PC before each (the first sample,
+before the title: 18.3 and 17.7 GB available). `tx_all1` (the cache with the other ports) 78.4 s. So no gain that is
+outside the spread of the runs, and no sign of the memory cost either, on this drive; the original report's
+gain (RX 7800 XT, 5 s sooner) and the PR's own NVMe measurement (unchanged, 6.1 to 6.3 s to the first frame) are the other two data. Left off
+until a run on a slow drive or with a cold cache shows more. Not measured: a cold cache (reboot), the load stutter beyond
+the five-second lines.
+
+**`VICTORY_DETILE_RETRY`** (on; `=0`: as before; A/B-able). `Staging::detile` says whether it detiled, after checking every
+part of the texture against the bounds `Layout::detile` checks (`Layout::check_detile`, in `victory-formats`) before it
+writes any, and `Last::convert` notes the memory's digest (or the write-watch's asking) only when it did. Before, the digest
+was noted before the conversion: a texture whose detiling failed ("texture not detiled") was never tried again while its
+memory stayed as it was, and kept the parts the failure had written, which went up with the next upload. A job of the upload
+ahead whose staging buffer is incomplete is left out of its batch and is the lists' (`refresh_all`, the others go on).
+Not taken from the PR: its change to the partly mapped path that stopped noting the digest of memory that reads as
+all zeros (kept as it always was); its prelude claim (this tree has no prelude upload).
+
+**Does the bug exist here.** In the data structure, yes: `unchanged_input_retries_a_failed_detile_then_skips_a_completed_one`
+(`texture::detile_retry`) runs the same refresh both ways, and as before a failed conversion is counted done and the same
+memory is never converted again; with the switch it is converted again and then skipped. In a world run it has not
+happened: "texture not detiled" appears in none of the 36 logs of the scratchpad (and the PR's own table of warnings
+shows none either, so what it measured between its two runs is not this fix).
+
+**Runs.** "texture not detiled" in `tx_old1` (`VICTORY_DETILE_RETRY=0`), `tx_cache1` (0) and `tx_all1` (on): 0, 0, 0, and no
+device removal; the retry never ran in the game here, so what a failed detiling does to the picture was not seen, and the
+only evidence of the fix is the tests (`texture::detile_retry`, `texture::ahead::tests`, `Layout::check_detile`'s). With it
+on the world frame median of `tx_all1` was 44.5 ms against 47.3 and 47.9 (see #454: one run each).
