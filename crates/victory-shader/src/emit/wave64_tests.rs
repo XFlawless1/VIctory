@@ -1655,3 +1655,65 @@ fn a_loop_behind_a_skip_is_translated_as_before() {
     assert!(scalar_loop_latches_of(&native).is_empty());
     scalar_loop_is_untouched(&native, None);
 }
+
+/// A lane mask read as a number inside a lane branch, with both host waves of a console wave64
+/// exchanging (kelvaroq patches 0033 and 0047, `VICTORY_WAVE_ZERO_MASK`; the test's choice here
+/// is `lower::TEST_ZERO_MASK`). Threads below s0 read both dwords of a scalar mask s[14:15] and
+/// store 1 + (lo ^ hi). An empty mask (`s_xor_b64 s[14:15], exec, exec`) is zero in both dwords
+/// whatever the other half of the console wave does; a copy of EXEC made in the entry block
+/// (`s_or_b64 s[14:15], exec, exec`) is read where it was made, by both waves; a mask only some
+/// lanes hold (`s_and_b64 s[14:15], exec, 1`) still needs every lane there.
+#[test]
+fn empty_and_copied_wave_masks_can_be_read_in_a_lane_branch() {
+    let lower_mask = |op, on| {
+        let native = native(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0007, // s_cbranch_execz to the restore of EXEC
+            op,
+            0x7E0A_020E, // v_mov_b32 v5, s14
+            0x7E0C_020F, // v_mov_b32 v6, s15
+            0x3A0A_0D05, // v_xor_b32 v5, v5, v6
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 5 << 8, // buffer_store_dword v5, off, s[8:11], 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let previous = lower::TEST_ZERO_MASK.replace(Some(on));
+        let result = lowered(&native, &p, &HashSet::new());
+        lower::TEST_ZERO_MASK.set(previous);
+        result
+    };
+    const XOR_EXEC: u32 = 0x898E_7E7E; // s_xor_b64 s[14:15], exec, exec
+    const OR_EXEC: u32 = 0x888E_7E7E; // s_or_b64 s[14:15], exec, exec
+    const AND_ONE: u32 = 0x878E_817E; // s_and_b64 s[14:15], exec, 1
+    const EXCHANGED: &str = "a lane mask exchanged where not every lane runs";
+    // (as before: all three are refused, with the switch off)
+    assert!(
+        matches!(lower_mask(XOR_EXEC, false), Err(ShaderError::Unsupported { what, .. }) if what == EXCHANGED),
+        "the empty mask with the switch off"
+    );
+    assert!(lower_mask(OR_EXEC, false).is_err(), "the copy of EXEC with the switch off");
+    let dynamic = lower_mask(AND_ONE, true);
+    assert!(
+        matches!(&dynamic, Err(ShaderError::Unsupported { what, .. }) if *what == EXCHANGED),
+        "{:?}",
+        dynamic.err()
+    );
+    let empty = lower_mask(XOR_EXEC, true).expect("empty mask");
+    let copied = lower_mask(OR_EXEC, true).expect("copy of EXEC");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, copied_mask) in [(&empty, false), (&copied, true)] {
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        for below in [1, 32, 40, 64] {
+            let bits = if copied_mask { u64::MAX >> (64 - below) } else { 0 };
+            let expected = ((bits as u32) ^ (bits >> 32) as u32).wrapping_add(1);
+            if let Some(actual) = on_the_card(shader, [below, 0]) {
+                assert_eq!(actual, expected, "{below} active lanes, copied mask {copied_mask}");
+            }
+        }
+    }
+}

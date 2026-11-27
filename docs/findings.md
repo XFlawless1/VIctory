@@ -290,3 +290,22 @@ translation either way: a uniform exit, a loop with only per-lane results, a con
 loop behind a skip. **Census: 0 of 25,689 programs change** (this port and the one before it, against the first commit's
 build): the PR's conditions are narrow (one console wave, no LDS, nothing but plain scalar and lane-local vector
 instructions, nested loops with one entry and one exit), and no program of the pack meets them here.
+
+**An empty lane mask reads as 0, and a copy of an entry mask is ballotted at its source (kelvaroq 0033 and the mask pieces of
+0047; `VICTORY_WAVE_ZERO_MASK=0` is the old behaviour; `TRANSLATOR_VERSION` 4).** In a console wave64 program run as two host
+waves, a mask read as a number needs both waves to ballot it where every lane runs. A mask that is identically empty
+(`s_xor_b64 s[14:15], exec, exec`) now reads as 0 in both dwords whatever the other wave does (0033; `Bool::FALSE`), and a
+mask a lane branch copies (`s_mov_b64`, or `s_and_b64` / `s_or_b64` of one value with itself) from one written in the entry
+block is ballotted there (0047's `entry_mask_copied_by`). Not taken from 0047: the signature order, the 0x218 stub and the
+diagnostics. Changed from the patches: the empty-mask shortcut also asks for `Structured::active` (a complement of a mask
+has a FALSE lane bit where it is written and is not zero), and both pieces are behind the one switch, on by default (0033 has
+its piece off by default, 0047 on). The test (a mask read in a lane branch, both dwords stored per lane): the empty mask and the
+copy of EXEC are refused with the switch off and translate with it, a mask only some lanes hold is still refused, and both
+give the right word on the card for 1, 32, 40 and 64 lanes. **Census: 9 programs change**, eight tiled cascade shadow
+rasterizers, `cascadeshadows_rendering:CS_ShadowRenderTiledMisc`, `...MiscCB`, `...MiscCBPPPC`, `...MiscAlpha`,
+`...MiscAlphaPPPC`, `...MiscHair`, `...MiscHairPPPC`, `...MiscPPPC`, and `sr_tracing:CS_RayPrePass_Alpha`. All validate and
+make their host pipelines on the card (9 of 9 before and after). They are not rescued: with the switch off and on each is
+translated in the same last form (the one without skips, scalars followed, waves of 32; the two before it are refused with the
+same texts at the same places), so the change is inside that form, in how a mask read as a number is made where it is
+provably empty or copied. That the nine come out the same on the card was not checked program by program (nothing here runs them
+against a reference), and the pictures of two runs are not comparable pixel by pixel.
