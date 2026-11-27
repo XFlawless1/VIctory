@@ -576,7 +576,7 @@ apart (sd 0.21 ms, 124 gaps, none off by 3 ms), the upload costs nothing that sh
 
 The `flick_batch` metric (every third frame of 280 to 520 saved, logo frames over 400,000 bytes, share equal in size to
 the one three frames before), one 40 s run each: old 51 % (23 of 45), fix 0 % (0 of 44), old with `VICTORY_JOIN_PARTS=1`
-(the refreshes behind the steps, which costs the frame time `VICTORY_JOIN_PARTS=8` saves) 0 % (0 of 44): the repeat goes
+(the refreshes behind the steps again: it gives up what `VICTORY_JOIN_PARTS=8` was made for, 0.6 to 3 ms a frame in its own measurements) 0 % (0 of 44): the repeat goes
 with the refreshes in front, which is what the cause above says. The pictures of the fix and of that control are the
 same ones (equal PNG sizes frame for frame).
 
