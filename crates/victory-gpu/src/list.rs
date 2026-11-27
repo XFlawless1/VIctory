@@ -1118,6 +1118,8 @@ extern "system" fn copy_texture_region(
                 if let Some(host) = crate::host::host() {
                     ensure_state(list, dst.resource, COPY_DEST);
                     let _ = list.first_use(dst.resource as usize);
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::bio_in(dst.resource, "zeroed", 0, std::ptr::from_ref(list) as usize);
                     crate::texture::zeros(list, host, to);
                 }
             } else {
@@ -1134,6 +1136,23 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_copied_into(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::bio_in(dst.resource, "copy", dst.footprint.offset as u32, std::ptr::from_ref(list) as usize);
+        #[cfg(feature = "diagnostics")]
+        if let Some(held) = crate::resource::made_copy(dst.resource) {
+            if held.base > 0 {
+                crate::capture::bio(dst.resource, "copy-held-base", held.base);
+            }
+            // (An upload ahead of the lists that is on its way, 1, or has
+            // run, 2: `crate::texture::ahead`.)
+            match held.ahead.load(std::sync::atomic::Ordering::Acquire) {
+                1 => crate::capture::bio(dst.resource, "copy-ahead-on-its-way", 0),
+                2 => crate::capture::bio(dst.resource, "copy-ahead-ran", 0),
+                _ => {}
+            }
+        }
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;

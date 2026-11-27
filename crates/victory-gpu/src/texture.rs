@@ -656,6 +656,18 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
+/// Small block-compressed textures a pass before a draw of the title's bake
+/// recorded an upload of, by title texture, with the moment ([`one_upload`]).
+static BAKE_UPLOADS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// Whether a pass that is no pass of a bake leaves out the upload of a small
+/// block-compressed texture that a pass of a bake recorded an upload of, which
+/// no submission has run yet (`VICTORY_BAKE_ONE_UPLOAD`; `=0`: it is
+/// recorded, as before; A/B-able in diagnostics builds).
+fn one_upload() -> bool {
+    crate::toggled!("VICTORY_BAKE_ONE_UPLOAD")
+}
+
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
@@ -735,6 +747,9 @@ pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
+    }
+    if let Some(seen) = BAKE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        seen.remove(&resource);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -849,6 +864,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::bio_in(resource, "upload-skipped", first, std::ptr::from_ref(list) as usize);
         return;
     }
     // Once a list for each first level; not again for one that the list's
@@ -867,6 +884,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(staging) = staging(resource, &copy, first) else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    crate::capture::bio_in(
+        resource,
+        if BAKING.get() { "upload-baking" } else { "upload" },
+        first,
+        std::ptr::from_ref(list) as usize,
+    );
     use std::sync::atomic::Ordering::Relaxed;
     let baking = BAKING.get();
     if baking {
@@ -904,6 +928,37 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             } else {
                 staging.waiting.store(crate::host::moment().max(1), Relaxed);
             }
+        }
+    }
+    // The title's bake copies its results into small block-compressed
+    // textures, the first copy into one after the pass before the bake's draw
+    // uploaded it (whatever its memory holds: another texture's bytes). A
+    // pass of another list that finds the texture not uploaded yet (the list
+    // of the bake's pass has not been submitted) records an upload of it too,
+    // and that list can run after the bake's copies: the copies are
+    // overwritten with what the memory holds, and the texture shows that for
+    // good (random cells on a face: run `fc_a1`, 10 of the 18 textures that
+    // had such a second upload). It is left out here.
+    if one_upload() && crate::resource::is_small_bc(resource) {
+        let mut seen = BAKE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if baking {
+            seen.insert(resource as usize, crate::host::moment());
+        } else if !staging.uploaded.load(Relaxed)
+            && seen.get(&(resource as usize)).is_some_and(|&at| !crate::host::long_ago(at, 1000, 2))
+        {
+            static LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LEFT_OUT.fetch_add(1, Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    left_out = n,
+                    "uploads of small block-compressed textures that a pass of the title's bake has one on its way for are left out (VICTORY_BAKE_ONE_UPLOAD=0: recorded)"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::capture::bio_in(resource, "upload-left-out", first, std::ptr::from_ref(list) as usize);
+            list.defer_texture(staging);
+            return;
         }
     }
     // The host texture has the staging buffer's contents: only the check
@@ -1038,11 +1093,17 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
+        list.defer_host(move || {
+            noted.note_held();
+            #[cfg(feature = "diagnostics")]
+            noted.note_census();
+        });
         return;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
+        #[cfg(feature = "diagnostics")]
+        staging.note_census();
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
@@ -1289,6 +1350,27 @@ impl Staging {
     fn note_held(&self) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+    }
+
+    /// Diagnostics (`VICTORY_STALE_CENSUS`): the hash of the bytes title
+    /// memory holds as the upload of this staging buffer goes to the card, for
+    /// every texture whatever its guards say (`holds` is set only for a texture
+    /// the guards cannot watch), kept by host copy ([`differs_from_upload`]).
+    #[cfg(feature = "diagnostics")]
+    fn note_census(&self) {
+        if crate::resource::stale_census_mode() == 0 {
+            return;
+        }
+        let hash = with_read(self.read, |read| {
+            (crate::host::read_there(self.memory, read) != 0).then(|| (digest(read), page_digests(read)))
+        });
+        if let Some((hash, pages)) = hash {
+            CENSUS_HELD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Default::default)
+                .insert(self.serial, (self.first, hash, pages));
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -1804,6 +1886,87 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
             return false;
         }
         digest(read) == held
+    })
+}
+
+/// Diagnostics (`VICTORY_STALE_CENSUS`, [`crate::resource::stale_census`]):
+/// whether the bytes of title memory a title texture's host copy was filled
+/// from (all of them, as [`unchanged`] reads them) are the bytes memory
+/// holds now. `None`: the host copy holds nothing of memory (never filled
+/// from it) or the memory cannot be read; else whether they differ, and how
+/// many bytes were compared.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn differs_from_upload(resource: This) -> Option<(bool, u64)> {
+    let copy = crate::resource::made_copy(resource)?;
+    let held = CENSUS_HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&copy.serial).map(|h| (h.0, h.1)));
+    let (from, held) = match held {
+        Some(held) => held,
+        None => (*copy.holds.lock().unwrap_or_else(|e| e.into_inner()))?,
+    };
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    let layout = &layout.planes[0].layout;
+    let size = layout.bytes_from(from) as usize;
+    with_read(size, |read| {
+        if crate::host::read_there(memory, read) == 0 {
+            return None;
+        }
+        Some((digest(read) != held, size as u64))
+    })
+}
+
+/// Diagnostics: for each host copy (by [`crate::resource::HostTexture::serial`]),
+/// the first level and the hash of the bytes title memory held as its last
+/// upload went to the card ([`Staging::note_census`]).
+#[cfg(feature = "diagnostics")]
+static CENSUS_HELD: Mutex<Option<HashMap<u64, (u32, Digest, Vec<u64>)>>> = Mutex::new(None);
+
+/// Diagnostics: one hash for each 4 KiB of `bytes`.
+#[cfg(feature = "diagnostics")]
+fn page_digests(bytes: &[u8]) -> Vec<u64> {
+    bytes.chunks(4096).map(|page| digest(page).0 as u64).collect()
+}
+
+/// Diagnostics: for a texture [`differs_from_upload`] found changed, which
+/// of its pages of 4 KiB changed since the upload, and whether the three
+/// windows of [`fingerprint`] (what the texture pass looks at again) cover
+/// any of them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stale_detail(resource: This) -> String {
+    let Some(copy) = crate::resource::made_copy(resource) else { return String::new() };
+    let held = CENSUS_HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&copy.serial).map(|h| (h.0, h.2.clone())));
+    let Some((from, held)) = held else { return String::from("no page hashes") };
+    let Some((memory, desc)) = crate::resource::texture_memory(resource) else { return String::new() };
+    let Some(layout) = crate::resource::texture_layout(&desc) else { return String::new() };
+    let size = layout.planes[0].layout.bytes_from(from) as usize;
+    with_read(size, |read| {
+        if crate::host::read_there(memory, read) == 0 {
+            return String::from("unreadable");
+        }
+        let now = page_digests(read);
+        let changed: Vec<usize> = (0..now.len().min(held.len())).filter(|&i| now[i] != held[i]).collect();
+        let windows: Vec<(usize, usize)> = if size <= 48 << 10 {
+            vec![(0, size)]
+        } else {
+            vec![(0, 16 << 10), ((size / 2) & !0xfff, 16 << 10), (size - (16 << 10), 16 << 10)]
+        };
+        let seen = changed.iter().any(|&p| windows.iter().any(|&(at, n)| p * 4096 < at + n && (p + 1) * 4096 > at));
+        format!(
+            "{} of {} pages of 4 KiB changed, first at {:#x}, last at {:#x}; the recheck's windows {} one of them",
+            changed.len(),
+            now.len(),
+            changed.first().map_or(0, |p| p * 4096),
+            changed.last().map_or(0, |p| p * 4096),
+            if seen { "cover" } else { "cover none of" }
+        )
     })
 }
 

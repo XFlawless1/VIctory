@@ -934,3 +934,84 @@ runs made (`probe1` off; `t1`, `t2`, `t3`, `ab1` and the recorded one with the s
 often logged, "a texture picked by index changed after its upload", 90 times in the switch-off run and 150-200 in the others, the
 recorded run, whose tables were whole, among them: not looked into), and the frame time; no picture was compared. Captures of the same
 frame number of two runs differ in 99 % of their pixels whatever the switch (the camera and the time are not the same).
+
+## The diner's cells on the waitress's face: a texture uploaded twice, the second upload run after the bake's copies (RTX 5080, Series S profile, 2026-11-27)
+
+**What it looked like.** In the cutscene where the standing waitress says "Another one? You don't want a leche caliente, or
+something?" her face and neck were covered with random multicoloured cells, with skin showing between them in places; her
+hair, shirt and the other woman were fine. The cells are 4x4 blocks of one of her decorations (makeup, lipstick): the title
+bakes a character's decorations once, while the scene loads, into small block-compressed textures of its own (128x128 and
+256x256, BC1, BC3 and BC7, eight levels), by compute passes and one `CopyTextureRegion` a level, and its shaders lay them over
+the skin by their alpha. Of the 74 to 94 such textures a run had at frame 2300, 10 to 21 (12 to 22 %) held random bytes (the colour endpoints of their blocks
+are ordered c0 > c1 in 50 % of them and the alpha endpoints a0 > a1 in 58 %, those of the others in 81 % and 90 %).
+
+**The cause, from a biography of each texture.** `VICTORY_DUMP_BC=1` (diagnostics build with `VICTORY_CAPTURE`) saves the
+block-compressed textures the title's copies write at the listed frames and now writes, into `frame-<n>-bc-index.txt`, what
+happened to each: the host copy made, every upload recorded (`upload-baking`: the pass before a draw of the bake, `upload`: any
+other pass) and every copy, each with four hex digits of the list it was recorded into (`f<frame>:<what>:<argument>@<list>`).
+In run `fc_a1` all 10 noise textures had an `upload` in a list other than the one that holds their copies, in this order:
+
+    made, upload-baking @A, upload @B, copy @A (eight times)
+
+Of the 18 textures that had such an upload 10 were noise, of the 76 that had none, 0. The pass before a draw of the bake records
+the texture's upload into the bake's list A (it has to: the bake may sample the texture), the title's eight copies follow in A.
+Another list B, recorded at the same time on another thread, finds the texture "not uploaded" (`Staging::uploaded` is set when
+a list is submitted, not when it is recorded) and records an upload of its own. When B runs after A, the upload puts what title
+memory holds (another texture's bytes: the title writes a baked texture on the card, not in its memory) over the eight copies,
+and the texture keeps it. The code is older than today's switches: the pass before a bake is from 2026-11-24 and 25 (c96b4f2b, 8d79927a).
+
+**Why it seemed to be mended by so many things.** It is a race between lists. With today's texture switches all off (`fc_h1`:
+1 cell block in 11 diner frames), with no upload ahead of the lists (`fc_b1`), with a census of stale textures before every
+bake that uploads what it finds changed (`fc_s1`: it makes the bake wait), with the same census without our own hash
+(`fc_w1`), and in the run with every listed frame and census of the diagnostics (`fc_a1`) the diner showed no cells in the one
+run each got (the bake's detection of its draws by their targets with its settling, `fc_n1`, cut them to 4 blocks in a frame,
+the neck still showed them), and a third plain run (`fc_off3`: 22 % noise textures) had none either: the diner's own
+decorations were not among the noise ones. None of those single runs says more than that.
+
+**The fix.** `VICTORY_BAKE_ONE_UPLOAD` (on; `=0`: as before; A/B-able in diagnostics builds, `crate::texture::upload_from`). A
+pass that is no pass of a bake leaves out the upload of a small block-compressed texture (2D, up to 256 texels across) of which a
+pass of a bake recorded an upload less than a second ago and no submission has run. The pass of the bake brings the same bytes,
+in the list that holds the copies. (The pass before a draw of the bake and the list of its pixel shaders are from codec-d/cool_fox
+f4b48ad7 and voidopcode/vilocity b74dbe1f, ported earlier; this rule is new.)
+
+**Measured** (`VICTORY_BAKE_ONE_UPLOAD=0` and default turn by turn, `-NoSmoothMotion`, pictures every 20 frames, frame 2300's
+dump; the cells counted by the detector below in the frames that show the waitress; `fc_off1` to `fc_on3` one build, `fc_on4`
+and `fc_off4` the build of the commit, run to frame 5000):
+
+| run | switch | diner frames | frames with cells | cell blocks (all, most in a frame) | textures <= 256 texels with random bytes at frame 2300 | world ms/frame |
+|---|---|---|---|---|---|---|
+| off1 | off | 8 | 5 | 54, 13 | 16 of 74 (21.6 %) | 50.8 |
+| on1 | on | 14 | 0 | 0, 0 | 0 of 92 (0 %) | 39.5 |
+| off2 | off | 10 | 10 | 418, 59 | 11 of 89 (12.4 %) | 41.3 |
+| on2 | on | 14 | 0 | 0, 0 | 2 of 87 (2.3 %) | 40.9 |
+| on3 | on | 12 | 0 | 0, 0 | 6 of 92 (6.5 %) | 40.8 |
+| off3 | off | 11 | 0 | 0, 0 | 21 of 94 (22.3 %) | 40.9 |
+| on4 | on | 14 | 0 | 0, 0 | 0 of 94 (0 %) | 38.3 |
+| off4 | off | 13 | 0 | 21, 5 | 10 of 63 (15.9 %) | 38.5 |
+
+The detector (a script of the notes, not in the tree): a 12x12-pixel block of the 960x540 picture is a cell block if at least 14
+of its pixels are saturated and lit (chroma at least half the largest channel, largest channel at least 56) and fall into at
+least four of twelve 30-degree hue bins with two pixels each; a frame shows cells at 6 blocks. A frame is a diner frame if its
+mean luma is under 70 and 2,000 sampled pixels have the shirt's colour. The run before this one (`fc_o1`, the build without the
+biographies, switch not there) had 9 frames with cells, up to 56 blocks a frame.
+
+In the cell (frames 3600 to 4400 of `fc_on4` and `fc_off4`) the INMATE print on the jumpsuit's back showed in all 42 pictures of
+each, its middle letters under the hair as in `fc_o1`; skin and hair looked the same in the two. (Whether the print is baked
+into one of the noise textures was not checked; in these two runs it did not show as noise.)
+
+What is left: 2 of the 87 noise textures of `fc_on2` and 6 of the 92 of `fc_on3`. The six were made in one frame and had
+uploads recorded by two or three other lists *before* the pass of the bake recorded its own (`upload @B1, upload @B2,
+upload-baking @A, copy @A`; two of them had a third after it, which was left out). Of the two of `fc_on2` one was in that
+order, the other a texture whose address another texture took later (its biography is that of the other). Leaving out the
+uploads that came first as well would show a texture without its upload in a list that runs before the bake's, so they are
+not. An upload that could be told not to run (predication on a flag the copy sets) would close this order; it was not tried.
+
+**Not touched.** The blocky patches where a light falls on a lit face or on cloth (the right woman's cheek and her hoodie in
+the same scene, a man's face in the scene before it) appear in runs with the switch on and off alike: they have 16-pixel edges
+and are not baked textures. They were not looked into further.
+
+Examples of noise textures of `fc_a1` at frame 2300 (all 128x128, BC3 sRGB, eight levels, baked in frames 2127 to 2139): the
+title's resources 0x227876b7620, 0x2273b492be0, 0x227816404f0 and 0x22984a16c80. `descriptor behind a lane condition`
+(Marvisak/VIctory ff474638, cool_fox f4b48ad) is not it: it concerns `alphaResolve:CS_AlphTransmissionPrefilterMip`, and
+its port on `port/upstream-translator` changes none of the 25,689 translations of the title's pack. Tests of this tree:
+413 in `victory-gpu` (diagnostics, lib), 34 ignored, as at e090f1a7 (none added).

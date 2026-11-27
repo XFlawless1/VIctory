@@ -244,6 +244,8 @@ fn claim_as(resource: This, first: u32, there: u64, closed: bool) -> Option<Take
     if super::no_wait() && super::fill_unlocked() {
         staging.expected.store(if there == u64::MAX { super::mapped_bytes(staging.memory, staging.read) } else { there }, Relaxed);
     }
+    #[cfg(feature = "diagnostics")]
+    crate::capture::bio(resource, "ahead-taken", first);
     let job = Arc::new(Job { staging, copy, asked: std::time::Instant::now(), then: Mutex::new(State::Pending(Vec::new())) });
     BYTES.fetch_add(job.staging.read as u64, Relaxed);
     {

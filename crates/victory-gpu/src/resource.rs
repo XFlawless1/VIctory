@@ -1361,6 +1361,8 @@ pub(crate) fn want_level(this: This, first: u32) {
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::capture::bio(this, "replaced", first);
     if let Some(old) = made.take() {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
@@ -1627,6 +1629,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::bio(
+            this,
+            if host.grown.load(Relaxed) {
+                "made-after-replace"
+            } else if r.host.gone.load(Relaxed) {
+                "made-after-sweep"
+            } else {
+                "made"
+            },
+            base,
+        );
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2255,6 +2269,147 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// Diagnostics (`VICTORY_STALE_CENSUS=<n>`; `2`: and what is found stale is
+/// told to the texture pass as memory the runtime wrote, so that it is
+/// uploaded again): at the present of a listed frame, which title textures
+/// of 256 KiB to 6 MiB that the title fills have a host copy whose bytes
+/// are not the bytes title memory holds now. Such a texture shows what its
+/// memory held when it was uploaded; the writes since went unnoticed (the
+/// guards and notices did not tell of them, and the fingerprint looks read
+/// 48 KiB of it). At most 3 GB are read per census, from a start that moves
+/// from census to census. Logs a summary and up to 60 of them:
+/// `stale texture census: ...`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn listed_census_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_STALE_CENSUS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `VICTORY_STALE_AT_BAKE=<n>`: the same census, `n` as above, at the pass
+/// before a draw of the title's bake (at most every 16th frame): what the
+/// bake takes from its sources stays in what it makes.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn bake_census_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_STALE_AT_BAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Whether either census is on: the hash of title memory is taken at every
+/// upload ([`crate::texture::Staging::note_census`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn stale_census_mode() -> u32 {
+    listed_census_mode().max(bake_census_mode())
+}
+
+/// The census of `VICTORY_STALE_CENSUS` at the present of a listed frame.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn stale_census(frame: u64) {
+    let mode = listed_census_mode();
+    if mode != 0 {
+        stale_census_with(frame, mode, 3 << 30);
+    }
+}
+
+/// The census of `VICTORY_STALE_AT_BAKE` before a draw of the bake.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn stale_at_bake(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mode = bake_census_mode();
+    if mode == 0 {
+        return;
+    }
+    let last = LAST.load(Relaxed);
+    if last != 0 && frame < last + 16 {
+        return;
+    }
+    LAST.store(frame, Relaxed);
+    stale_census_with(frame, mode, 1 << 30);
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn stale_census_with(frame: u64, mode: u32, most_bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run = RUNS.fetch_add(1, Relaxed);
+    let began = std::time::Instant::now();
+    // (The table stays locked: a texture leaves it before it is freed.)
+    let table = textures();
+    let all: Vec<usize> = table.iter().copied().collect();
+    let start = (run as usize * 7919) % all.len().max(1);
+    let (mut checked, mut bytes, mut stale, mut stale_bytes, mut unjudged, mut woken) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut stale_placed = 0u64;
+    let mut shown = 0;
+    for k in 0..all.len() {
+        let at = all[(start + k) % all.len()];
+        let this = at as This;
+        let r = resource(this);
+        let size = footprint(&r.desc).map_or(0, |f| f.size);
+        if !fills(&r.desc) || !(256 << 10..=6 << 20).contains(&size) || r.desc.dimension != 3 {
+            continue;
+        }
+        if bytes >= most_bytes {
+            break;
+        }
+        // Only a texture some descriptor slot or list holds: the title keeps
+        // the objects of textures whose memory it gave to others (74,000 of
+        // them, 12,000 "stale" ones with nothing showing them).
+        if !made_copy(this).is_some_and(|copy| crate::host::references(&copy.texture) > 1) {
+            continue;
+        }
+        match crate::texture::differs_from_upload(this) {
+            None => unjudged += 1,
+            Some((differs, n)) => {
+                checked += 1;
+                bytes += n;
+                if differs {
+                    stale += 1;
+                    stale_bytes += size;
+                    stale_placed += u64::from(r.host.placed.load(Relaxed));
+                    let memory = r.data() as u64;
+                    if mode >= 2 {
+                        crate::descriptor::host::remapped(memory as usize, size as usize);
+                        woken += 1;
+                    }
+                    if shown < 60 {
+                        shown += 1;
+                        let detail = crate::texture::stale_detail(this);
+                        let (base, ahead) = made_copy(this).map_or((0, 0), |c| (c.base, c.ahead.load(Relaxed)));
+                        tracing::info!(
+                            frame,
+                            detail = %detail,
+                            base,
+                            ahead,
+                            memory = format_args!("{memory:#x}"),
+                            bytes = size,
+                            width = r.desc.width,
+                            height = r.desc.height,
+                            levels = r.desc.mip_levels,
+                            format = r.desc.format,
+                            placed = r.host.placed.load(Relaxed),
+                            "stale texture: its host copy is not what title memory holds"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!(
+        frame,
+        textures = all.len(),
+        checked,
+        stale,
+        stale_placed,
+        stale_mb = stale_bytes >> 20,
+        unjudged,
+        read_mb = bytes >> 20,
+        woken,
+        ms = began.elapsed().as_millis() as u64,
+        "stale texture census (VICTORY_STALE_CENSUS)"
+    );
+    drop(table);
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]
@@ -2395,6 +2550,33 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, false).map(|made| made.0)
+}
+
+/// Whether `this` is a 2D block-compressed texture of at most 256 texels
+/// across, of the kind the title's bakes make.
+#[cfg(windows)]
+pub(crate) fn is_small_bc(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension == 3 && matches!(r.desc.format, 70..=84 | 94..=99) && r.desc.width <= 256
+}
+
+/// Diagnostics: the host copy title texture `at` has now, if it is still
+/// alive (it is named by address: it may have been freed since a note was
+/// made) and has one.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn current_copy(at: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let all = textures();
+    if !all.contains(&at) {
+        return None;
+    }
+    // SAFETY: a texture leaves the table before it is freed, under the lock
+    // held here (`Drop for Resource`).
+    let r = unsafe { &*(at as *const Resource) };
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(host, _)| host.clone())
 }
 
 /// A host texture like the title's: same description, in GPU memory,

@@ -47,7 +47,128 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || auto(n) || bake_auto(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// `VICTORY_AUTO_DINER=<frames>/<every>`: when a picture saved from the
+/// frame ([`save`]) is the diner's (dark, with the waitress's pink shirt
+/// over some 2% of it, as the notes' `diner_detect.py` counts), the frames
+/// from a few frames after it, `<frames>` of them, `<every>` frames apart,
+/// are listed as if `VICTORY_CAPTURE_FRAMES` named them: their draws, their
+/// targets with `VICTORY_DUMP_TARGETS`, the censuses. The diner is anywhere
+/// between frames 1,000 and 2,800 from run to run, which no list of frame
+/// numbers finds.
+fn auto_spec() -> Option<(u32, u64)> {
+    static SPEC: std::sync::OnceLock<Option<(u32, u64)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let spec = std::env::var("VICTORY_AUTO_DINER").ok()?;
+        let (frames, every) = spec.split_once('/')?;
+        Some((frames.trim().parse().ok()?, every.trim().parse::<u64>().ok()?.max(1)))
+    })
+}
+
+/// The frame [`auto`] lists next: 0 while the diner is waited for, the
+/// number of the frame, `u64::MAX` when all are done.
+static AUTO_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUTO_LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn auto(n: u64) -> bool {
+    n != 0 && AUTO_NEXT.load(std::sync::atomic::Ordering::Relaxed) == n
+}
+
+/// A frame [`auto`] listed was presented: the next is `every` frames on.
+fn auto_advance(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((_, every)) = auto_spec() else { return };
+    if !auto(frame) {
+        return;
+    }
+    if AUTO_LEFT.fetch_sub(1, Relaxed) <= 1 {
+        AUTO_NEXT.store(u64::MAX, Relaxed);
+    } else {
+        AUTO_NEXT.store(frame + every, Relaxed);
+    }
+}
+
+/// `VICTORY_AUTO_BAKE=<skip>/<frames>/<every>`: from the `<skip>`th draw
+/// that looks like a bake of the title's ([`bake_seen`], called by the
+/// diagnostics of `crate::draw`), `<frames>` frames three frames after it and
+/// `<every>` frames apart are listed (as for [`auto`]): the draws, copies
+/// and uploads of bakes, which come before the scene they are for.
+fn bake_spec() -> Option<(u64, u32, u64)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, u64)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let spec = std::env::var("VICTORY_AUTO_BAKE").ok()?;
+        let mut parts = spec.split('/');
+        let skip = parts.next()?.trim().parse().ok()?;
+        let frames = parts.next()?.trim().parse().ok()?;
+        let every = parts.next()?.trim().parse::<u64>().ok()?.max(1);
+        Some((skip, frames, every))
+    })
+}
+
+static BAKE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BAKE_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BAKE_LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn bake_auto(n: u64) -> bool {
+    n != 0 && BAKE_NEXT.load(std::sync::atomic::Ordering::Relaxed) == n
+}
+
+/// A draw that looks like a bake was recorded in the frame being built.
+pub(crate) fn bake_seen() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((skip, frames, _)) = bake_spec() else { return };
+    if BAKE_SEEN.fetch_add(1, Relaxed) + 1 == skip.max(1) {
+        let at = crate::queue::presented() + 1 + 3;
+        BAKE_LEFT.store(frames, Relaxed);
+        BAKE_NEXT.store(at, Relaxed);
+        tracing::info!(frame = at, "a bake is under way: the frames from here are listed (VICTORY_AUTO_BAKE)");
+    }
+}
+
+/// A frame [`bake_auto`] listed was presented: the next is `every` frames on.
+fn bake_advance(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((_, _, every)) = bake_spec() else { return };
+    if !bake_auto(frame) {
+        return;
+    }
+    if BAKE_LEFT.fetch_sub(1, Relaxed) <= 1 {
+        BAKE_NEXT.store(u64::MAX, Relaxed);
+    } else {
+        BAKE_NEXT.store(frame + every, Relaxed);
+    }
+}
+
+/// The picture of frame `n` (rows of 8-bit colour `pitch` bytes apart): the
+/// diner's? Then [`auto`] lists the frames after it.
+fn auto_watch(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((frames, _)) = auto_spec() else { return };
+    if AUTO_NEXT.load(Relaxed) != 0 || width < 480 || height < 270 {
+        return;
+    }
+    let step = (width as usize / 480).max(1);
+    let (mut pink, mut light, mut seen) = (0u32, 0u64, 0u64);
+    for y in (0..height as usize).step_by(step) {
+        let row = &rows[y * pitch..];
+        for x in (0..width as usize).step_by(step) {
+            let p = &row[x * 4..x * 4 + 3];
+            let (r, g, b) = if bgra { (i32::from(p[2]), i32::from(p[1]), i32::from(p[0])) } else { (i32::from(p[0]), i32::from(p[1]), i32::from(p[2])) };
+            light += ((r * 3 + g * 6 + b) / 10) as u64;
+            seen += 1;
+            // The waitress's shirt: red, with green and blue at 0.70 and 0.67 of it.
+            if r >= 120 && ((g as f32 / r as f32) - 0.70).abs() < 0.05 && ((b as f32 / r as f32) - 0.67).abs() < 0.06 {
+                pink += 1;
+            }
+        }
+    }
+    if seen > 0 && light / seen < 70 && pink >= 2000 {
+        AUTO_LEFT.store(frames, Relaxed);
+        AUTO_NEXT.store(n + 4, Relaxed);
+        tracing::info!(frame = n, pink, "the diner is on the picture: the frames after it are listed (VICTORY_AUTO_DINER)");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -152,11 +273,30 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || shot(n) || before_world || in_world)
+}
+
+/// `VICTORY_SHOT_FRAMES=<from>-<to>/<every>`: the pictures of these frames
+/// are saved, and nothing else of them (no listing of the frame's draws, no
+/// targets: a listed frame costs a text of 7 MB and, with the dumps, seconds).
+/// The diner of the opening is anywhere between frames 1,000 and 2,800
+/// from run to run, so a run's pictures are taken every 20 or 40 frames over
+/// that range.
+fn shot(n: u64) -> bool {
+    static RANGE: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+    RANGE
+        .get_or_init(|| {
+            let spec = std::env::var("VICTORY_SHOT_FRAMES").ok()?;
+            let (range, every) = spec.split_once('/')?;
+            let (from, to) = range.split_once('-')?;
+            Some((from.trim().parse().ok()?, to.trim().parse().ok()?, every.trim().parse::<u64>().ok()?.max(1)))
+        })
+        .is_some_and(|(from, to, every)| (from..=to).contains(&n) && (n - from).is_multiple_of(every))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+    auto_watch(n, width, height, pitch, bgra, rows);
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
 }
 
@@ -485,9 +625,193 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// With `VICTORY_DUMP_BC=1` (and `VICTORY_CAPTURE`): block-compressed
+/// textures the title's copies write on the card (`CopyTextureRegion`: the
+/// bake of its decorations copies each level of its compressed result into
+/// one), held as the first copy into each is seen and saved at the present
+/// of every listed frame as `frame-<n>-bc-<i>-<resource>-<w>x<h>-f<format>-m<levels>.bin`:
+/// the raw blocks of every level of the first slice, level 0 first, rows
+/// without padding (`bc_decode.py` in the notes makes pictures of them).
+/// At most 4,000 textures and 512 MiB.
+#[cfg(feature = "diagnostics")]
+static BAKED: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// By resource: the frame of the first copy into it, of the last, and the copies.
+#[cfg(feature = "diagnostics")]
+static BAKED_WHEN: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, u64, u32)>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn dump_bc_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_BC"))
+}
+
+/// By resource: what happened to a small block-compressed texture of the
+/// title's, in order (frame, what, argument), the first 80 events; written
+/// to the index of the dump of each listed frame.
+#[cfg(feature = "diagnostics")]
+static BIO: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<(u64, &'static str, u32, u32)>>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes `what` (with `arg`: a level, a first level, a subresource) of title
+/// texture `resource` for its biography, if it is a small block-compressed
+/// texture and `VICTORY_DUMP_BC=1`. A note like the last one of the frame is
+/// not kept again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bio(resource: crate::object::This, what: &'static str, arg: u32) {
+    bio_in(resource, what, arg, 0);
+}
+
+/// [`bio`] of something a list records: `list` is the list's address (0: none),
+/// of which the biography keeps a few digits, to tell the lists apart.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bio_in(resource: crate::object::This, what: &'static str, arg: u32, list: usize) {
+    if resource.is_null() || !dump_bc_on() || !crate::resource::is_small_bc(resource) {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    let list = (list >> 4) as u32 & 0xffff;
+    let mut all = BIO.lock().unwrap_or_else(|e| e.into_inner());
+    let events = all.get_or_insert_with(Default::default).entry(resource as usize).or_default();
+    if events.len() < 80 && events.last() != Some(&(frame, what, arg, list)) {
+        events.push((frame, what, arg, list));
+    }
+}
+
+/// Notes the destination of a copy of the title's, if it is block-compressed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_copied_into(resource: crate::object::This) {
+    if resource.is_null() || !dump_bc_on() {
+        return;
+    }
+    // (When each was first and last copied into, and how many copies: the
+    // garbage among them comes in runs of the bakes that were made together.)
+    {
+        let frame = crate::queue::presented() + 1;
+        let mut when = BAKED_WHEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = when.get_or_insert_with(Default::default).entry(resource as usize).or_insert((frame, frame, 0));
+        e.1 = frame;
+        e.2 += 1;
+    }
+    let mut held = BAKED.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= 4000 || held.iter().any(|&(r, _)| r == resource as usize) {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource) else { return };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if matches!(d.Format.0, 70..=84 | 94..=99) && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        held.push((resource as usize, copy));
+    }
+}
+
+/// At the present of listed frame `frame`: saves the textures [`note_copied_into`] holds.
+#[cfg(feature = "diagnostics")]
+fn dump_baked(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !dump_bc_on() {
+        return;
+    }
+    let Some(folder) = folder() else { return };
+    let Some(host) = crate::host::host() else { return };
+    let held: Vec<_> = BAKED.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+    let mut total = 0u64;
+    let mut saved = 0usize;
+    // Whether the host copy each texture has now is the one the first copy
+    // wrote (the title samples the one it has now: one replaced by a copy
+    // with more levels is dumped as it is).
+    let mut state_of = vec!["gone"; held.len()];
+    for (i, (resource, first_copy)) in held.iter().enumerate() {
+        let (copy, status) = match crate::resource::current_copy(*resource) {
+            Some(now) if std::sync::Arc::ptr_eq(&now, first_copy) => (now, "same"),
+            Some(now) => (now, "replaced"),
+            None => (first_copy.clone(), "gone"),
+        };
+        state_of[i] = status;
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        let levels = u32::from(d.MipLevels);
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, copy.state.load(Relaxed)) as i32);
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let Ok(list) = host.new_list() else { return };
+        // SAFETY: an open list of ours and a live texture.
+        let reads: Vec<_> = unsafe {
+            if state != source {
+                list.list.ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+            }
+            let reads = (0..levels)
+                .filter_map(|level| read_back_of(&host.device, &list.list, texture, level))
+                .collect();
+            if state != source {
+                list.list.ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+            }
+            reads
+        };
+        list.close();
+        host.execute(&[&list]);
+        let block = if matches!(d.Format.0, 70..=72 | 79..=81) { 8usize } else { 16 };
+        let mut bytes = Vec::new();
+        for (buffer, footprint) in &reads {
+            let f = footprint.Footprint;
+            let (across, down) = ((f.Width as usize).div_ceil(4), (f.Height as usize).div_ceil(4));
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the copy finished; the mapping spans the footprint's rows.
+            unsafe {
+                if buffer.Map(0, None, Some(&mut data)).is_err() {
+                    continue;
+                }
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), f.RowPitch as usize * down);
+                for row in 0..down {
+                    bytes.extend_from_slice(&rows[row * f.RowPitch as usize..][..across * block]);
+                }
+                buffer.Unmap(0, None);
+            }
+        }
+        total += bytes.len() as u64;
+        if total > 512 << 20 {
+            break;
+        }
+        let name = format!("frame-{frame}-bc-{i:04}-{resource:#x}-{}x{}-f{}-m{levels}.bin", d.Width, d.Height, d.Format.0);
+        if std::fs::write(folder.join(name), bytes).is_ok() {
+            saved += 1;
+        }
+    }
+    // The frames of the copies, in the order the files are numbered.
+    {
+        let when = BAKED_WHEN.lock().unwrap_or_else(|e| e.into_inner());
+        let bios = BIO.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = String::new();
+        for (i, (resource, _)) in held.iter().enumerate() {
+            let (first, last, copies) = when.as_ref().and_then(|m| m.get(resource).copied()).unwrap_or_default();
+            let events: Vec<String> = bios
+                .as_ref()
+                .and_then(|m| m.get(resource))
+                .map(|e| e.iter().map(|(f, what, arg, list)| format!("f{f}:{what}:{arg}@{list:x}")).collect())
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "{i} {resource:#x} first_copy_frame {first} last_copy_frame {last} copies {copies} host_copy {} | {}
+",
+                state_of[i],
+                events.join(" ")
+            ));
+        }
+        let _ = std::fs::write(folder.join(format!("frame-{frame}-bc-index.txt")), text);
+    }
+    tracing::info!(frame, saved, held = held.len(), bytes = total, "block-compressed textures of the title's copies saved (VICTORY_DUMP_BC)");
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    auto_advance(frame);
+    bake_advance(frame);
+    #[cfg(feature = "diagnostics")]
+    dump_baked(frame);
+    #[cfg(feature = "diagnostics")]
+    crate::resource::stale_census(frame);
     #[cfg(feature = "diagnostics")]
     log_statistics();
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
