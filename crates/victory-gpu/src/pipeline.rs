@@ -327,7 +327,7 @@ pub(crate) fn builder_rests(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if no_draws() || !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -450,10 +450,35 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_NO_DRAWS=1`: no host pipeline is made and no shader is
+/// translated; every draw and dispatch of the title is dropped. The title
+/// runs as before (its code, streaming, memory) and the picture stays
+/// black: the frame time then is the title's own code and our system
+/// services (copies, uploads, descriptors, the lists' walk), the ceiling no
+/// graphics work can raise. Off by default; unset or any other value leaves
+/// everything as it was. A measuring switch, not a way to play.
+///
+/// Ported from kelvaroq's 0061-no-draw.patch (GPL-3.0-or-later), which took
+/// it from the switch of the same name in Cold Project VI. Here the
+/// creation-time start of known pipelines ([`make::early`]) is skipped too,
+/// and a dropped draw is not counted by reason (diagnostics builds took a lock
+/// and made a string per draw for that).
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -513,6 +538,9 @@ pub(crate) fn is_skipped(this: This) -> bool {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
+    if no_draws() {
+        return;
+    }
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -568,7 +596,9 @@ fn hand_out(
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
-    make::early(&host);
+    if !no_draws() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]

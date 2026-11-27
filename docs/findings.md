@@ -282,3 +282,24 @@ against a serial one, over unaligned title addresses and starts: with the old fo
 with overflow`; with the fix they pass. The other two cuts of this kind in the file (`find_pieces`, `copy_wide`) cannot go
 below their start. Not shown: that the title has such a range (an unaligned copy start with a range of 32 MiB or more from
 the copy's start); the world's big heap copy is 100-170 MB, and its start is not known to be unaligned.
+
+**0061, `VICTORY_NO_DRAWS=1` (a measuring switch: unset, or any other value, is as before).** No host pipeline is made and no
+shader is translated: `pipeline::host_pipeline` gives none, a pipeline known from earlier runs is not started when the title
+creates it, and the structure builder stays off. Every draw, dispatch and indirect execution of the title is dropped and the
+picture stays black; what a frame costs is the title's own code and the part of our work that does not wait for a draw (its
+calls into our lists, their walk, fences, presents). Taken as kelvaroq's patch has it (a switch of the same name in Cold
+Project VI); added here: the creation-time start of known pipelines is left out too, and a dropped draw is not counted by
+reason (diagnostics builds took a lock and made a string for each, on the threads that replay the lists).
+Measured (RTX 5080, Series S, 240 s, scripted keys to the prison, the frame lines that had 3,500+ draws and dropped
+commands a frame, the first 6 of them left out): **33.3 ms (30.0 fps) in every line from the 7th on (17 of 17), one run**
+(`kq_nodraws1`); 3,600-3,800 draws and dispatches and about 4,600 indirect executions dropped a frame, the submission
+preparing 0.7-0.9 ms (copies 0.1 ms; no texture slot placed: nothing is made that a draw does not bind), `Present` 0.30 ms, no
+device loss, no warning but the switch's own, the black frames and the present-plane notes. The same keys without the switch, same build: 57.2 ms in a state of the cell
+with 6,200 draws a frame (27 lines; the scene had gone on to the guard at the door), and 44.8 ms at 4,460 draws a frame
+(29 lines; this run had `VICTORY_BARRIER_TEST=indirect` on, so it is no clean base). The title's cutscenes show 33.3 ms in
+the same builds with draws, so 33.3 ms is the title's own limiter for 30 fps (the host presents with sync interval 0):
+with every draw dropped the title and our walk of its lists fit inside it, and the frame time cannot show how far below.
+What the gap says: the 45-57 ms is not the title's code, which fits in 33.3 ms or less; at least 11-24 ms of it is drawing
+(recording draws, copies, uploads, the card). Not shown: the real floor under the cap (burning CPU in the list calls until
+the frame leaves 33.3 ms would give it; `VICTORY_BURN_CPU_US` burns on the submitting thread only), and whether the title
+takes other paths when no GPU result comes back (it did not stall or crash in this run).
