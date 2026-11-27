@@ -476,6 +476,43 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+thread_local! {
+    /// What this thread let go of while it made the tables of a draw ([`retire_resource_later`]).
+    static LATER: std::cell::RefCell<Vec<ID3D12Resource>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether the resources that the slots of a table made afresh let go of wait for one trip to the queue of
+/// retired objects, together with all this thread let go of while it made the table's draw
+/// ([`retire_resource_later`]), where each went on its own and took the queue's lock (and the count beside it,
+/// which all the recording threads add to) for it: 55,000 times a frame in the prison cell, 5-6 % of the
+/// recording threads' time. `VICTORY_RETIRE_BATCH=0`: each on its own, as before.
+pub(crate) fn retire_batching() -> bool {
+    crate::toggled!("VICTORY_RETIRE_BATCH")
+}
+
+/// [`retire_resource`], handed to the queue by [`retire_later_flush`] with the others of this thread.
+pub(crate) fn retire_resource_later(object: ID3D12Resource) {
+    LATER.with_borrow_mut(|later| later.push(object));
+}
+
+/// Hands the queue what [`retire_resource_later`] kept: each is numbered as [`retire_resource`] numbers it, as of
+/// now, which is the same submission or a later one than when it was let go (dropped no earlier).
+pub(crate) fn retire_later_flush() {
+    LATER.with_borrow_mut(|later| {
+        if later.is_empty() {
+            return;
+        }
+        let started = STARTED.load(Ordering::Acquire) + crate::queue::queued();
+        if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+            RETIREMENTS[0].fetch_add(later.len() as u64, Ordering::Relaxed);
+            later.clear();
+            return;
+        }
+        RETIREMENTS[1].fetch_add(later.len() as u64, Ordering::Relaxed);
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(later.drain(..).map(|object| (started, Retired::Resource(object))));
+    });
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -1152,7 +1189,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<std::collections::HashMap<usize, TwinUse, std::hash::BuildHasherDefault<AddressHash>>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1219,6 +1256,7 @@ type Note = (String, Option<(u64, u64)>);
 type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+    std::hash::BuildHasherDefault<AddressHash>,
 >;
 
 /// What a list does with a depth texture that has a colour twin
@@ -2227,9 +2265,9 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -6289,6 +6327,31 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
+    /// What a draw's reading of a texture or buffer can add to the list, as sizes: two readings that leave
+    /// these as they were recorded nothing between them (diagnostics: the check of
+    /// `VICTORY_READY_ENTRIES=verify`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn progress(&self) -> [usize; 14] {
+        let (states, twins) = (self.states.lock().unwrap_or_else(|e| e.into_inner()).len(), self.twins.lock().unwrap_or_else(|e| e.into_inner()).len());
+        let d = self.deferred();
+        [
+            self.epoch() as usize,
+            d.copies.len(),
+            d.kept.len(),
+            d.textures.len(),
+            d.uploads.len(),
+            d.refreshed.len(),
+            d.gpu_written.len(),
+            d.texture_aliases.len(),
+            d.writes.len(),
+            d.texture_backs.len(),
+            d.back_wanted.len(),
+            d.filled.len(),
+            states,
+            twins,
+        ]
+    }
+
     /// Something changed in this list that bringing a draw's textures and
     /// buffers up to date depends on: a texture's state, a twin, what was
     /// refreshed.
@@ -7374,8 +7437,16 @@ impl std::hash::Hasher for AddressHash {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        // A word at a time: the 12 bytes of a record (`[u32; 3]`) were twelve rounds, one for each byte.
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.write_u64(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(last) ^ (rest.len() as u64) << 56);
         }
     }
     fn write_usize(&mut self, n: usize) {
@@ -7387,6 +7458,49 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod address_hash_tests {
+    use super::AddressHash;
+    use std::hash::{Hash, Hasher};
+
+    fn hash<T: Hash>(value: &T) -> u64 {
+        let mut hasher = AddressHash::default();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The records of a title's descriptors (`[u32; 3]`: a tag, an entry, a generation) are hashed a word at a
+    /// time now: those that differ in one word still hash apart, and the table they key keeps them all.
+    #[test]
+    fn records_that_differ_in_a_word_hash_apart() {
+        let mut seen = std::collections::HashSet::new();
+        let mut table = std::collections::HashMap::<[u32; 3], u32, std::hash::BuildHasherDefault<AddressHash>>::default();
+        for entry in 1..=300u32 {
+            for generation in [1u32, 2, 3, 1 << 30 | 7, 2 << 30 | 9] {
+                let record = [0x4549_5676, entry, generation];
+                assert!(seen.insert(hash(&record)), "{record:?} hashes as another record");
+                table.insert(record, entry);
+            }
+        }
+        assert_eq!(table.len(), 1500);
+        assert_eq!(table[&[0x4549_5676, 77, 1 << 30 | 7]], 77);
+        assert_eq!(table.get(&[0x4549_5676, 77, 5]), None);
+    }
+
+    /// A word and a part of one are not mixed up: bytes of different lengths hash apart, and the same bytes alike.
+    #[test]
+    fn bytes_of_different_lengths_hash_apart() {
+        let mut seen = std::collections::HashSet::new();
+        for len in 0..=24usize {
+            let bytes = vec![0u8; len];
+            assert_eq!(hash(&bytes), hash(&bytes.clone()));
+            assert!(seen.insert(hash(&bytes)), "{len} zero bytes hash as fewer");
+        }
+        assert_ne!(hash(&[1u8, 2, 3]), hash(&[1u8, 2, 4]));
+        assert_ne!(hash(&[0u8, 0, 0, 0, 0, 0, 0, 0, 1]), hash(&[1u8, 0, 0, 0, 0, 0, 0, 0, 0]));
     }
 }
 
@@ -9090,9 +9204,14 @@ impl Host {
             for _ in 0..probe::gpu_copies() {
                 list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             }
+            // (`VICTORY_CAPTURE_COMPOSED=1`: what is shown, the interface laid over the game, not the game's plane alone,
+            // which is black while the title loads.)
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| {
+                    let shown = laid.as_ref().filter(|_| crate::switch::on("VICTORY_CAPTURE_COMPOSED")).unwrap_or(texture);
+                    crate::capture::read_back(&self.device, list, shown)
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };

@@ -107,6 +107,43 @@ Looked at with `VICTORY_DUMP_TARGETS` (every target a frame writes, 1280x720 und
 - Not looked at here: NVIDIA Smooth Motion (the launcher's default) interpolates frames the capture does not
   see; `-NoSmoothMotion` is the check.
 
+## Where a list call's time goes (RTX 5080, prison cell, 2026-11-27)
+
+Timed with the probes of `prep/submit-path` (`VICTORY_SITES=1`; not in this branch): an `ExecuteIndirect` is 15-16 us of the
+recording thread, the driver's own call 0.4-0.5 of it (`Dispatch` 0.6, `SetPipelineState` 0.7-1.0, root constants 0.1: the
+calls to the host list together are about 7 % of the time in list calls). The rest is `State::bind`, and in it
+`State::tables` is 63 % of all the time in list calls: the tables that hold a constant buffer are made afresh for each
+draw (8,700 a frame, 7.7 entries each; every entry looked up, copied, kept and its resource handed to the global queue of
+retired objects, 55,000 times a frame), and the title's own tables went through `mirror`, `readable` and `slot_tabled` at
+every draw.
+
+What was changed (all on; `=0` is the old behaviour):
+
+- `VICTORY_READY_ENTRIES`: an entry of the title's own tables that a draw brought up to date is left as it was for
+  later draws of the list that read it the same way while the list's epoch is unchanged (as `VICTORY_READY_ONCE` does for
+  tables made afresh); not what shaders write through, not a texture that stands for a render target.
+  `VICTORY_READY_ENTRIES=verify` reads such an entry all the same and counts the readings that added something to the
+  list (diagnostics). A first form that left aliases out too: 2,332 of 67 million readings added a copy and a kept
+  texture each, all views of a texture placed in a render target's memory (`texture::alias`: its source is found by the
+  memory's address and can be another render target by the next draw); with aliases read every time, more than 134
+  million readings in a run of 240 s, none of which added anything.
+- `VICTORY_RETIRE_BATCH`: what the slots of a table made afresh let go of goes to the queue of retired objects once for
+  the draw, not once each (numbered as of the end of the draw, so dropped no earlier than before).
+- Not switchable, same work: `make_listed` looks into the thread's table once, not twice; `AddressHash` takes a word at a
+  time (a three-word record was twelve rounds); the list's states, twins, texture set and alias table use it.
+- `VICTORY_CAPTURE_COMPOSED=1` (diagnostics): the captured frame is the one shown, the interface laid over the game.
+
+Measured inside one run with the two switches on and off in turn (`VICTORY_AB=4,VICTORY_READY_ENTRIES,VICTORY_RETIRE_BATCH`,
+world phases of 4,300-4,700 draws a frame, a cycle is four phases):
+
+| Run (the same code with the probes, branch `rec/list-call-cost`; this branch itself was built, tested and run for 100 s, not paired) | READY_ENTRIES on minus off | RETIRE_BATCH on minus off | both off | both on |
+|---|---|---|---|---|
+| 6 cycles (sd 0.1-0.2 ms, every cycle below 0) | **-1.44 ms** | **-1.18 ms** | 41.0 ms | 38.6 ms |
+
+Together 2.4 ms of a 41 ms frame (6 %). An earlier run, 7 cycles, before aliases were left out of the memo and before the
+constant buffer and plain slots joined the batch: -1.63 (sd 0.4) and -0.87 (sd 0.4). The changes that cannot be switched
+off are in both columns. Tests: 391 in `victory-gpu` (389 and the two of the hash), 295 in `victory-shader`.
+
 ## Measured and not worth it
 
 - Unordered early pipelines for everything (AMD's compiler crashed).

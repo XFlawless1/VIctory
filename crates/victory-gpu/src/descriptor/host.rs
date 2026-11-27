@@ -2960,7 +2960,8 @@ impl HostHeap {
         }
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
-        self.keep(index, kept.flatten());
+        // (Only `State::tables` makes slots so, and hands the queue what they let go of at its end.)
+        self.keep_listed(index, kept.flatten().as_ref());
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2983,32 +2984,37 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
+            // One look into the table for a view made before (it was two: whether it was there, and where).
+            let (start, step) = (views.start, views.step);
+            let slot = |i: u32| ListViews::slot_of(start, step, i);
+            let next = 2 * views.made.len() as u32;
+            let made = match views.made.entry(words) {
+                std::collections::hash_map::Entry::Occupied(made) => made.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let view = super::view_at(words[1], words[2])?;
+                    // (A constant buffer's bytes are copied for each draw.)
+                    if next >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                        return None;
+                    }
+                    let twin = twinned(&view);
+                    let kept = make_twinned(&view, slot(next), Some(slot(next + 1)))?;
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: is_texture_view(&view),
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    vacant.insert(ListView { view, at: next, twin, kept, listed })
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
-            }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            };
+            self.copy_from(index, slot(made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.copy_from(self.raw + index, slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_listed(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3082,6 +3088,31 @@ impl HostHeap {
         // this slot.
         if let Some(old) = old {
             crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::keep`] of `resource`, for a slot of a table made afresh (a thread's own, the recording
+    /// thread's: [`HostHeap::make_listed`]): the same again is told from the slot without a reference taken
+    /// first, and the resource the slot showed before is handed to the queue of retired objects with the others
+    /// the thread's draw lets go of ([`crate::host::retire_later_flush`], which `State::tables` calls at its end).
+    fn keep_listed(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        if !crate::host::retire_batching() {
+            return self.keep(index, resource.cloned());
+        }
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // The same again: nothing to retire.
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
+        if let Some(old) = old {
+            crate::host::retire_resource_later(old);
         }
     }
 
@@ -3212,6 +3243,17 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.constant_at_with(index, buffer, gpu, size, false);
+    }
+
+    /// [`HostHeap::constant_at`] for a table made afresh by the recording thread (`State::tables`, which calls
+    /// [`crate::host::retire_later_flush`] at its end): what the slot showed before goes to the queue of retired objects
+    /// with the others of the draw ([`HostHeap::keep_listed`]).
+    pub(crate) fn constant_at_listed(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.constant_at_with(index, buffer, gpu, size, true);
+    }
+
+    fn constant_at_with(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, listed: bool) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3249,7 +3291,11 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        if listed {
+            self.keep_listed(index, holds.then_some(buffer));
+        } else {
+            self.keep(index, holds.then(|| buffer.clone()));
+        }
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -3361,6 +3407,19 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Whether host slot `index` shows the view of the record the title has at `handle` now, and nothing
+    /// has made it stale: what [`HostHeap::mirror`] finds out first of all (without the view, which a caller
+    /// that has the answer of an earlier draw does not need).
+    pub(crate) fn mirror_current(&self, index: u32, handle: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        tag == VIEW_TAG
+            && index < self.count
+            && quick_mirror()
+            && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -6191,9 +6250,11 @@ impl ListViews {
         }
     }
 
-    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
-        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    /// Slot `i` of the heap, which begins at `start` and has `step` bytes to a slot (taken apart from the table, which
+    /// a caller that holds one of its views cannot borrow).
+    fn slot_of(start: usize, step: usize, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS);
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step }
     }
 }
 
