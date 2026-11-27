@@ -357,6 +357,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Entries of the title's own tables that draws of this list brought up to date: (slot's address, the
+    /// record's index and generation) → how ([`EntryReady`]).
+    entries_ready: std::collections::HashMap<(u64, u64), EntryReady, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -402,6 +405,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.entries_ready.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -3280,7 +3284,7 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3291,13 +3295,63 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        // What a draw before this one in the list brought up to date for a reader like this one, with nothing
+        // changed in the list since, is as it was ([`EntryReady`]); not what shaders write through.
+        let remember = ready_entries() && u.kind != ResourceType::Uav;
+        let reader = (STORES.get(), TESTED_DEPTH.get().0, u.kind);
+        let (frame, record) = (crate::frame::current(), crate::descriptor::record_at(handle));
+        let key = record.map(|words| (handle, u64::from(words[2]) << 32 | u64::from(words[1])));
+        // (With `VICTORY_READY_ENTRIES=verify` such an entry is read all the same, and whether that added anything to
+        // the list is counted: diagnostics.)
+        #[allow(unused_mut)]
+        let mut verifying = false;
+        if remember
+            && let Some(key) = key
+            && let Some(ready) = self.entries_ready.get(&key)
+            && ready.epoch == list.epoch()
+            && ready.frame == frame
+            && ready.reader == reader
+            && host.mirror_current(index, handle)
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                verifying = ready_verify();
+            }
+            if !verifying {
+                if ready.depth {
+                    TESTED_DEPTH.set((TESTED_DEPTH.get().0, true));
+                }
+                return;
+            }
+        }
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            let tested = TESTED_DEPTH.get();
+            TESTED_DEPTH.set((tested.0, false));
+            #[cfg(feature = "diagnostics")]
+            let before = verifying.then(|| list.progress());
+            let leave_as_is = readable(list, u.kind, &view);
+            #[cfg(feature = "diagnostics")]
+            if let Some(before) = before {
+                note_verified(before, list.progress(), u.kind, &view);
+            }
+            let depth = TESTED_DEPTH.get().1;
+            TESTED_DEPTH.set((tested.0, tested.1 || depth));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             } else {
                 host.slot_tabled(index);
+            }
+            if remember && let Some(key) = key {
+                if !leave_as_is {
+                    self.entries_ready.remove(&key);
+                } else {
+                    // (The epoch as it is now: what this changed itself it need not do again.)
+                    if self.entries_ready.len() >= ENTRIES_READY_MOST {
+                        self.entries_ready.clear();
+                    }
+                    self.entries_ready.insert(key, EntryReady { epoch: list.epoch(), frame, reader, depth });
+                }
             }
         }
     }
@@ -3547,7 +3601,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_at_listed(index, &buffer, gpu, size);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -3581,6 +3635,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        // What the slots of the tables made here let go of goes to the queue of retired objects.
+        crate::host::retire_later_flush();
         made
     }
 
@@ -4265,6 +4321,58 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
+/// Whether an entry of the title's own tables that a draw brought up to date is left as it is for the later draws of
+/// the list that read it the same way, while nothing in the list changed ([`EntryReady`];
+/// `VICTORY_READY_ENTRIES=0`: every draw goes through each entry again, as before). As [`ready_once`] does for the
+/// tables made afresh.
+fn ready_entries() -> bool {
+    crate::toggled!("VICTORY_READY_ENTRIES")
+}
+
+/// The most entries a list remembers ([`EntryReady`]).
+const ENTRIES_READY_MOST: usize = 16_384;
+
+/// `VICTORY_READY_ENTRIES=verify` (diagnostics builds): an entry a draw would leave as it was is read all the same,
+/// and `note_verified` counts the readings that added anything to the list.
+#[cfg(feature = "diagnostics")]
+fn ready_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_READY_ENTRIES").as_deref() == Ok("verify"))
+}
+
+/// A reading of an entry that [`EntryReady`] would have left out: `before` and `after` are
+/// [`HostList::progress`] around it. A difference is a reading that was not for nothing.
+#[cfg(feature = "diagnostics")]
+fn note_verified(before: [usize; 14], after: [usize; 14], kind: ResourceType, view: &View) {
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    static DIFFERED: AtomicU64 = AtomicU64::new(0);
+    let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if before != after {
+        let differed = DIFFERED.fetch_add(1, Ordering::Relaxed) + 1;
+        if differed <= 12 {
+            tracing::warn!(?kind, ?before, ?after, view = ?view, "a reading of a table entry that VICTORY_READY_ENTRIES would have left out added something to the list");
+        }
+    }
+    if checked >= 1024 && checked.is_power_of_two() {
+        tracing::info!(
+            checked,
+            differed = DIFFERED.load(Ordering::Relaxed),
+            "table entries read all the same with VICTORY_READY_ENTRIES=verify: how many added something to the list"
+        );
+    }
+}
+
+/// An entry of one of the title's own tables (a slot of the title's heap, by its address and the record in it) as
+/// a reader left it: the list's epoch ([`HostList::epoch`]) and the frame at which a draw brought it up to date,
+/// the reader (whether its shader stores to buffers, the depth target it only tests, the kind of view it reads
+/// the entry as), and whether that read the tested depth target.
+struct EntryReady {
+    epoch: u64,
+    frame: u64,
+    reader: (bool, usize, ResourceType),
+    depth: bool,
+}
+
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
@@ -4300,7 +4408,11 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// Brings what a view reads up to date in `list`. False for a view that is not left as it is for a draw that reads
+/// it again with nothing changed in the list ([`EntryReady`]): a texture the title placed in the memory of one the
+/// host writes (an alias), whose source is a render target found by the memory's address, and so may be another
+/// one by the next draw.
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -4324,13 +4436,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
     }
+    let mut leave_as_is = true;
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let alias_source = crate::resource::alias_of(*resource as This);
+            leave_as_is = alias_source.is_none();
+            let aliased = alias_source.is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
@@ -4383,6 +4497,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    leave_as_is
 }
 
 /// The pixel shaders whose draws get their slots listed
