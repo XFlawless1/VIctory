@@ -595,5 +595,6 @@ The world frame, 240 s runs (Enter every 8 s from 45 s, the prison at about 200 
 five-second lines of each: old 42.9 and 39.2 ms, fix 38.5 and 45.2 ms (two runs each, in the order old, fix, fix, old):
 the runs differ from each other by more than the two builds do, and the fix is neither shown faster nor slower. All four
 reached the world with no device removal in the log; each had one or two windows of the entry into the world of 160 to
-4,300 ms a frame (the old and the fixed alike). The uploads the fix adds are three textures of 12.5 MB at 30 a
-second where there were half as many; the detiling was done at every present before.
+4,300 ms a frame (the old and the fixed alike). What the fix adds is the card's copy of one movie frame (12.6 MB: the luma plane and two chroma
+planes) at each of the 30 presents a second, where it was every second one; the detiling was done at every present
+before.
