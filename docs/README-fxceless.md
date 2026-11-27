@@ -329,7 +329,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_SECTION_MB=<n>` | physical pages come from host sections of at most `n` MiB (`0`: one section per allocation, as always; see docs/findings.md for the default here) |
+| `VICTORY_SECTION_MB=<n>` | physical pages come from host sections of at most `n` MiB (default 2 on Windows; `0`: one section per allocation, as before, and the default under Wine; see docs/findings.md) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

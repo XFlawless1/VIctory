@@ -680,10 +680,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     1
 }
 
-/// MiB per section when `VICTORY_SECTION_MB` says nothing: 0 is one section
-/// per allocation, as always. (Windows only: under Wine a section is
-/// committed whole as a sparse file and the stall below is Windows' own.)
-const DEFAULT_SECTION_MB: usize = 0;
+/// MiB per section when `VICTORY_SECTION_MB` says nothing: 2 (0 is one
+/// section per allocation, as before). Windows only: under Wine a section is
+/// committed whole as a sparse file and the stall below is Windows' own, so
+/// there the default is 0. Measured on this PC (docs/findings.md): the
+/// title's mapping calls cost 4 to 6 times less in the world and the frames
+/// over 100 ms are a third as many.
+const DEFAULT_SECTION_MB: usize = 2;
 
 /// How many pages one section holds at most: `VICTORY_SECTION_MB` (0: one
 /// section per allocation), else [`DEFAULT_SECTION_MB`].
