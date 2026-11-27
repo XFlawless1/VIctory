@@ -33,8 +33,10 @@ pub mod structure;
 /// translate differently (`deferred_tiled:CS_DepthProcessingHBO`,
 /// `indirect_light_probes:CS_Primary_RegisterAllocationRequests`,
 /// `tiled_lighting:CS_ClusterLightsWorldSpace` and `...IntensityBased`,
-/// `water_interaction_foam:CS_DisturbersContribution`) on a host of 32-lane waves.
-pub const TRANSLATOR_VERSION: u32 = 2;
+/// `water_interaction_foam:CS_DisturbersContribution`) on a host of 32-lane waves;
+/// 3 = console threads of 2-D and 3-D groups of more than one host wave come from the wave
+/// counter (`VICTORY_THREAD_TICKETS`, Belobug PR #442).
+pub const TRANSLATOR_VERSION: u32 = 3;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

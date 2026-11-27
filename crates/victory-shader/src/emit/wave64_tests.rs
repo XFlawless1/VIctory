@@ -1105,3 +1105,153 @@ fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
     };
     assert!(error.to_string().contains("a first-lane read where not every lane runs"), "{error}");
 }
+
+/// Console lanes in a 2-D or 3-D group of more than one host wave (Belobug/VIctory-Belobug-AMD
+/// #216, PR #442). Each thread computes its flat id f from v0..v2 (`TIDIG_COMP_CNT` 2), reads lane
+/// 0's (`v_readlane`, so the program gets console lanes) and adds that + 1 to dword f. As on the
+/// console, every dword gets exactly one add, of 1 + its console wave's first id. A GPU need not
+/// fill such a group in aligned runs of flat ids (NVIDIA's 8 x 8 groups, 2 x 2 quads on AMD), and
+/// rounding a host wave's first flat id down to the wave size then gave two waves the same ids.
+fn flat_id_adds(threads: [u32; 3], wave64: bool) -> NativeProgram {
+    let [x, y, _] = threads;
+    let body = [
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD569_0005,
+        0x0001_FF01,
+        x, // v_mul_lo_u32 v5, v1, X
+        0xD569_0006,
+        0x0001_FF02,
+        x * y,       // v_mul_lo_u32 v6, v2, XY
+        0x4A08_0B00, // v_add_nc_u32 v4, v0, v5
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0xD760_000C,
+        0x0001_0104, // v_readlane_b32 s12, v4, 0
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+        0xE0C8_1000,
+        0x8002_0203, // buffer_atomic_add v2, v3, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&body, wave64, 1);
+    // (thread ids x, y and z in v0..v2)
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 2 << 11,
+        threads,
+    });
+    native
+}
+
+/// [`flat_id_adds`] lowered for host waves of `host_wave` lanes, with `tickets` as the test's
+/// choice for `VICTORY_THREAD_TICKETS` (None: the process's), and validated if `dxil.dll` is there.
+fn flat_id_adds_lowered(
+    threads: [u32; 3],
+    wave64: bool,
+    host_wave: u32,
+    tickets: Option<bool>,
+) -> Result<HostShader, String> {
+    let native = flat_id_adds(threads, wave64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let before = lower::TEST_TICKETS.replace(tickets);
+    let shader = lowered_on(&native, &p, &HashSet::new(), host_wave);
+    lower::TEST_TICKETS.set(before);
+    let shader = shader.map_err(|e| format!("{e:?}"))?;
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(shader)
+}
+
+/// The adds of [`flat_id_adds`] on the hardware device (None without one that takes the
+/// program), and what each dword must hold.
+fn flat_id_adds_on_the_card(
+    shader: &HostShader,
+    threads: [u32; 3],
+    wave64: bool,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let w: u32 = if wave64 { 64 } else { 32 };
+    let n: u32 = threads.iter().product();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let out = whole_uav(shader, [0, 0], n)?;
+    Some((out, (0..n).map(|t| 1 + (t & !(w - 1))).collect()))
+}
+
+/// Group shapes of more than one host wave: the 2-D and 3-D ones of the title's console wave32
+/// programs (8 x 8 and 4 x 4 x 4 at 32 lanes are 88 + 2 programs of its archive), and shapes
+/// whose last host wave is partial.
+const SHAPES_32: [[u32; 3]; 12] = [
+    [32, 2, 1],
+    [8, 8, 1],
+    [4, 4, 4],
+    [32, 2, 2],
+    [16, 16, 1],
+    [8, 8, 2],
+    [16, 2, 4],
+    [10, 10, 1],
+    [12, 12, 1],
+    [24, 8, 1],
+    [6, 6, 1],
+    [32, 4, 2],
+];
+
+#[test]
+fn console_threads_of_multidimensional_groups_are_one_each() {
+    let mut ran = Vec::new();
+    for (wave64, host_wave) in [(false, 32), (true, 64), (true, 32)] {
+        let w: u32 = if wave64 { 64 } else { 32 };
+        let mut shapes = SHAPES_32.to_vec();
+        shapes.push([w, 2, 1]);
+        for threads in shapes {
+            let what = format!("console wave{w}, host waves of {host_wave}, {threads:?}");
+            let shader = flat_id_adds_lowered(threads, wave64, host_wave, None)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            if let Some((out, want)) = flat_id_adds_on_the_card(&shader, threads, wave64) {
+                assert_eq!(out, want, "{what}");
+                ran.push(what);
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: {ran:#?}");
+}
+
+/// `VICTORY_THREAD_TICKETS=0` (here: the test's own choice) is the translation this tree had:
+/// the console-wave32 programs of groups of 2-D or 3-D shapes and more than one wave differ from
+/// the ones with the counter, those of 1-D groups and of one host wave do not.
+#[test]
+fn the_ticket_switch_changes_only_multidimensional_groups_of_several_waves() {
+    let make = |threads, tickets| {
+        flat_id_adds_lowered(threads, false, 32, Some(tickets))
+            .expect("lowered")
+            .dxil
+    };
+    for threads in SHAPES_32 {
+        assert_ne!(make(threads, true), make(threads, false), "{threads:?}");
+    }
+    for threads in [[64, 1, 1], [32, 1, 1], [4, 4, 2], [8, 4, 1]] {
+        assert_eq!(make(threads, true), make(threads, false), "{threads:?}");
+    }
+}
+
+/// What the old rounding gives on this card, one line per shape (no assertion: which shapes
+/// collide depends on the card and the driver; the run on an RTX 5080 is in docs/findings.md).
+/// Run with `-- --nocapture`.
+#[test]
+fn the_old_rounding_of_console_threads_on_this_card() {
+    let mut bad = Vec::new();
+    for threads in SHAPES_32 {
+        let shader = flat_id_adds_lowered(threads, false, 32, Some(false)).expect("lowered");
+        for run in 0..4 {
+            let Some((out, want)) = flat_id_adds_on_the_card(&shader, threads, false) else {
+                return;
+            };
+            let wrong = out.iter().zip(&want).filter(|(a, b)| a != b).count();
+            if wrong > 0 {
+                bad.push(format!("{threads:?} run {run}: {wrong} of {} dwords wrong", want.len()));
+                break;
+            }
+        }
+    }
+    eprintln!("rounding: {} of {} shapes wrong on the card: {bad:#?}", bad.len(), SHAPES_32.len());
+}

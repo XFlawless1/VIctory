@@ -226,3 +226,35 @@ b4ba4bbb, bf7833a9, 9576c45f (the ambient stand-in settling by the clock, "rooms
 seconds after walking in"): conflicts in `descriptor/host.rs` and `host.rs`. The host-copy refresh, heap-record, guard
 and renderer-port commits are another piece of work's; FidelityFX, RX 9070 XT, output and scale switches, the frame
 rate switch and the cache-core affinity are not wanted.
+
+## Ports from Belobug's pull requests and from kelvaroq (2026-11-27)
+
+Five changes ported by hand from third-party code (Belobug/VIctory-Belobug-AMD pull requests #442, #345 and #366;
+stellarr-studio/kelvaroq patches 0033 with the mask pieces of 0047, and 0052; all GPL-3.0-or-later), each its own commit with
+a switch, a card test and a census. The census is `VICTORY_HOST_WAVE=32 victory translate <shaders.rpf> --list --validate
+--jobs 8` (26,084 programs, 25,689 distinct translations, about 100 s) before and after, compared by the emitted hash of
+each distinct translation. 319 of the distinct programs do not come out whole, before and after every commit (195 "resources:
+an address in an SGPR that is no root parameter", 119 emitted but refused by the validator, 5 "a descriptor read only as
+data"); the 25,570 that validate still do after each. Tests: `cargo test -p victory-shader --lib` was 295 passed, 4
+ignored at a3892b0f.
+
+**Console threads of 2-D and 3-D groups from the wave counter (Belobug #442; `VICTORY_THREAD_TICKETS=0` is the old
+translation; `TRANSLATOR_VERSION` 3).** A console-lane program in a group of more than one host wave took its console thread
+from its host wave's first flat id rounded down to the wave size, exact only while each host wave holds an aligned run of
+flat ids. It now takes a block of the group's LDS counter (`wave_base`, which only console wave64 programs on waves of 32
+used), and a partial wave takes the last block, not any (the PR's second fix; groups of one host wave are left as they were).
+The test (`console_threads_of_multidimensional_groups_are_one_each`: each thread adds 1 + its console wave's first id at its
+own id) shows the bug on this RTX 5080: the old rounding is wrong for 7 of 12 shapes, 32 x 2 (64 of 64 dwords), 32 x 2 x 2
+(128 of 128), 32 x 4 x 2 (256 of 256), 10 x 10 (64 of 100), 12 x 12 (96 of 144), 24 x 8 (128 of 192) and 6 x 6 (8 of 36), and
+exact for 8 x 8, 4 x 4 x 4, 16 x 16, 8 x 8 x 2 and 16 x 2 x 4. With the counter all 26 runs on the card (13 shapes, console
+wave32 and wave64 on waves of 32) are exact, and with `VICTORY_THREAD_TICKETS=0` the test fails (first at 32 x 2).
+Tests 295 -> 298, `victory-gpu` 389 -> 389. **Census: 4 programs change**, `terrainshadows:CS_ComputeTerrainVisibility`,
+`scattering_transmittance_system:CS_GatherRaymarchedLocalLights`, `TAA2:CS_TAA2_Resolve` and `TAA2U:CS_TAA2_Resolve`
+(`VICTORY_WAVE_WHY=1` prints `THREAD-TICKETS` for the programs that take the counter: three 8 x 8 groups of console wave32
+programs, which the old rounding numbered right on this card, and one group of 36 threads whose partial wave takes the last
+block). All four validate and make their host pipelines on the card before and after. The PR's census (88 console wave32 8 x 8
+programs, among them `cascadeshadows_processing`, `rtdirectionalshadows` and `shadowmask`) was of a tree without a counter;
+here 8 x 8 programs of console wave64 already took it, none of those three families changes (6, 40 and 32 distinct programs),
+and so nothing here links this change to the blocky shadows. What is not shown: that any of the four was wrong before (the
+shapes the card gets wrong, 32-wide rows, are not among the title's programs here). World runs of this build are with those of
+the last port, below.

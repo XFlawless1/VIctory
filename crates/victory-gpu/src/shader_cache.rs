@@ -120,6 +120,7 @@ fn build() -> [u8; 32] {
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRSTLANE_ALIKE",
             "VICTORY_LANE_UNIFORM",
+            "VICTORY_THREAD_TICKETS",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
