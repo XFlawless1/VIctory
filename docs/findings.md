@@ -619,3 +619,19 @@ because the machine lock was not free: only the in-run toggling of the host side
 and what a cold shader cache costs (the first run with the switch on translates every shader it meets: 6.5 s frames in the first
 world seconds of the first run) are not measured, (3) the base changes the translation of 85 % of the programs. Turning it on would
 be: `CB_BASE_DEFAULT` in `emit/shader.rs`, `TRANSLATOR_VERSION` 5.
+
+**The picture was not compared on one frame.** A frame of the prison cell was recorded with the switch on and the host side off
+(`VICTORY_CB_BASE=1 VICTORY_CB_SPLIT=0 VICTORY_RECORD=<folder> VICTORY_RECORD_AT=f4200`: the tables whole as before and the base the
+table's own place, so the recorded heap and root arguments serve the shaders of both translations): 45 submissions, 308 lists, 93,359
+resources, 1,267 pipelines, 6.8 GB of the card's memory. It was to be replayed with the shaders of the translation off and of the one on
+(`victory replay <folder> --retranslate <dir>` for each, then `--shaders <dir> --images <dir> --raw`, the textures compared texel by
+texel). That did not work on this card: the replay could not make again the 2,191 buffers the frame had placed in heaps opened from title
+memory (`CreatePlacedResource` refused them with E_INVALIDARG: they carry the cross-adapter flag and the heap the replay makes does not);
+with the flag dropped for placed resources (tried, not kept) the frame was made and the replay then hung the card (`0x887A0006`) before
+it drew anything; and `--retranslate` needs the game's directory configured (`VICTORY_GAME_DIR`), which the job did not give it. What was
+kept of it: `--retranslate` takes `VICTORY_HOST_WAVE` and `VICTORY_HOST_RDNA` (default as before: 64 lanes, RDNA). So the exactness of the
+host side (blocks, shared blocks, the title's own entries) is shown by the runs only: no device removal and no `ERROR` line in the six
+runs made (`probe1` off; `t1`, `t2`, `t3`, `ab1` and the recorded one with the switch on), the same kinds of warnings (the one most
+often logged, "a texture picked by index changed after its upload", 90 times in the switch-off run and 150-200 in the others, the
+recorded run, whose tables were whole, among them: not looked into), and the frame time; no picture was compared. Captures of the same
+frame number of two runs differ in 99 % of their pixels whatever the switch (the camera and the time are not the same).
