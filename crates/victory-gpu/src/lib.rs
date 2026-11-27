@@ -27,6 +27,8 @@ mod compose;
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod introlog;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;

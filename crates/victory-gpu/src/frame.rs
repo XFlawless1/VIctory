@@ -149,6 +149,8 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let _called = crate::timeline::span("the title's frame wait");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let blocked_from = Instant::now();
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
@@ -157,6 +159,13 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::introlog::note(
+        "wait",
+        u64::from(kind),
+        u64::from(timeout_ms) | u64::from(flags) << 32,
+        u64::from(hr == S_OK) << 63 | blocked_from.elapsed().as_micros() as u64,
+    );
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

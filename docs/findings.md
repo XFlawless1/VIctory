@@ -528,3 +528,48 @@ index buffer of a host copy directly, and for `place_copy` and indirect clamps (
 `tx_all1` has no device removal. Left off by default: nothing here shows the switch to help (error 538 could not be
 counted), and a wrong state in a barrier is a way to break a picture; what would justify turning it on is a run with
 `VICTORY_D3D12_DEBUG=1` on a PC with Graphics Tools that shows 538 gone and the picture unchanged.
+
+## The Rockstar-logo zoom was shown in sixes, three pictures twice (2026-11-27)
+
+`VICTORY_TEXTURE_DIRTY_FRONT=0` gives the old behaviour. Reported as a flickering loading screen: the zoom of the
+Rockstar logo intro (the radial blur out of a star, then the artwork zooming in) "goes twice". Measured: the composed
+pictures were A B C A B C D E F D E F (frame n, n+1, n+2 equal n+3, n+4, n+5, pixel for pixel), 51 % of the logo frames
+equal to the one three before (42 of 82 in a run that saved every frame of 270 to 470; 0 of 84 and 0 of 83 for the one or
+two before).
+
+**It was not the title, and not the pacing.** `VICTORY_INTRO_LOG=<from>,<to>` (diagnostics; written to the log after the
+last present) records, per present, the title's Present call and ours, the frame waits, the checks of texture memory,
+the texture uploads recorded, and a hash sampled from the memory of the movie's three luma planes (3840x2160, 8 bits,
+in a ring of three, each frame of the movie written into the next of them). In the run without any capture
+(`run_li_b_nocap`, presents 345 to 468): the title's Presents were 33.2 ms apart (median; 124 gaps, two hitches of one
+late and one early present each), the swap chain's the same, the flip wait blocked 29 ms every present and the origin
+wait never. And at every one of those presents exactly one of the three movie memories held a new picture (119 of 119):
+the title's movie advances by a frame every present, as on the console. What was wrong was what we did with it: of the
+three textures, each was uploaded to the host copy every second time the title drew it: uploads and keeps in turns of
+three, `UkkkUUUkkkUUU...` over the three luma planes (and the same for their chroma planes).
+
+**Cause.** A texture a draw reads through a table is checked at the submission and detiled when its memory changed; the
+check sets `Staging::dirty`, and the next list that samples it records an upload. The step of a list that recorded an
+upload cleared `dirty` ("noted before the check below, which sets it again if it detiles"). That is the order of the
+steps when the check comes after them. With `VICTORY_JOIN_PARTS` above 1 (`scripts/play-nvidia.ps1` sets 8) the
+submission's refreshes are done in front of all its steps (`refresh_front`, `VICTORY_WIDE_TEXTURES`), so the check
+detiled the new frame first and the step then cleared the note: the next sampling of that texture, three presents later,
+found `dirty` false and recorded no upload (a keep), although the title had written another picture since; the one
+after that found it set again (the check of the keep's submission detiled and nothing cleared it), uploaded, and the
+step cleared it again. A texture the title changes at every draw was uploaded every second time: a picture twice,
+and the one between skipped.
+
+**Fix.** The step leaves `dirty` set if the staging buffer was detiled in the same submission, before it (a counter of
+submissions, `texture::next_submission`, kept in `Staging::detiled_in`); a buffer that was not detiled in it (the
+texture did not change) is cleared as before, and one detiled after the step (the order the note was written for) is
+set by that detiling as before. `VICTORY_TEXTURE_DIRTY_FRONT=0`: cleared whatever came before, as it was. A texture
+that changes once is uploaded once more than needed (as it was in the other order); one that changes at every draw
+every time.
+
+**Measured** (`li_d_fixcap`, `li_e_fixnocap` against `li_a_cap`, `li_b_nocap`, same build, 40 s from the start, Enter
+at 12 s): over the logo frames saved every present, equal to the one three before: 51 % without the fix, 0 % with it
+(0 of 83); no two logo frames of the run equal. The luma planes are uploaded at every present (124 of 124 presents
+from 345, none kept). The zoom's step from one saved frame to the next (mean absolute difference of 96x54
+thumbnails) grows smoothly, 8.2, 8.9, 9.7, 10.2, ... 24.4 for frames 393 to 411, where before the fix it went 14, 13,
+-20, 14, 13, +26 (back to the first of the three, and on by two steps). The title's Presents with the fix are 33.33 ms
+apart (sd 0.21 ms, 124 gaps, none off by 3 ms), the upload costs nothing that shows there.

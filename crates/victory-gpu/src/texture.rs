@@ -73,6 +73,9 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// The submission ([`next_submission`]) the staging buffer was last
+    /// detiled in ([`dirty_after_front`]).
+    detiled_in: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// How many bytes of the texture's memory were mapped when a list last
@@ -187,6 +190,55 @@ const HOT_FRAMES: u64 = 64;
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+}
+
+/// The submission whose lists' steps are being run (1 and up;
+/// [`next_submission`]).
+static SUBMISSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A submission begins: what its refreshes detile is marked with its number.
+pub(crate) fn next_submission() {
+    SUBMISSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a texture a submission's refresh detiled, before the step of the
+/// list that recorded its upload (the refreshes of a submission are done in
+/// front of its steps, `VICTORY_JOIN_PARTS` above 1), stays dirty after that
+/// step, as one detiled after it does. The step used to clear the note
+/// whatever came before it, and the next list that sampled the texture then
+/// recorded no upload, for what the title wrote since had not been looked at
+/// yet: a movie's frames in a ring of three, written every frame, were shown
+/// every second round of the ring, three frames twice in turns (A B C A B C
+/// D E F D E F: the Rockstar logo's zoom, each picture on screen twice and
+/// every other group of three skipped). A texture that is not changing is
+/// not detiled by the refresh, so it is not dirty after the step either.
+/// `VICTORY_TEXTURE_DIRTY_FRONT=0`: cleared as before.
+fn dirty_after_front() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DIRTY_FRONT").is_none_or(|v| v != "0"))
+}
+
+/// What a staging buffer's note `dirty` is after the step of a list that
+/// recorded its upload: set if the buffer was detiled in this very
+/// submission (`detiled_in`, `submission`) and the switch is on.
+fn dirty_after_step(front: bool, detiled_in: u64, submission: u64) -> bool {
+    front && detiled_in == submission
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::dirty_after_step;
+
+    /// A buffer detiled by an earlier part of the same submission is dirty
+    /// after the upload's step; one detiled in an earlier submission, or
+    /// not at all, is not; and with the switch off none is.
+    #[test]
+    fn dirty_only_when_detiled_in_the_same_submission() {
+        assert!(dirty_after_step(true, 7, 7));
+        assert!(!dirty_after_step(true, 6, 7));
+        assert!(!dirty_after_step(true, 0, 7));
+        assert!(!dirty_after_step(false, 7, 7));
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -864,11 +916,19 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !baking && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+        #[cfg(feature = "diagnostics")]
+        if staging.read >= 1 << 20 {
+            crate::introlog::note("kept", staging.memory as u64, staging.read as u64, 0);
+        }
         list.defer_texture(staging);
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    #[cfg(feature = "diagnostics")]
+    if staging.read >= 1 << 20 {
+        crate::introlog::note("upload", staging.memory as u64, staging.read as u64, u64::from(staging.dirty.load(Relaxed)));
+    }
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -954,7 +1014,10 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         let staging = staging.clone();
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+            // Dirty again if a refresh of this submission ran before this
+            // step, as those ahead of the lists' steps do ([`dirty_after_front`]).
+            let again = dirty_after_step(dirty_after_front(), staging.detiled_in.load(Relaxed), SUBMISSION.load(Relaxed));
+            staging.dirty.store(again, Relaxed);
         });
     }
     // A host copy that took the place of one with fewer levels: the slots
@@ -1257,10 +1320,12 @@ impl Staging {
         let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
         if alone && !exact && last.hash.is_some() {
+            self.log(1, 0);
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                self.log(2, 0);
                 return 0;
             }
             // (Noted when the conversion has run: a failed one is asked for
@@ -1275,6 +1340,7 @@ impl Staging {
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            self.log(3, 0);
             return size;
         }
         // View memory has no write-watch, and a texture there was hashed
@@ -1290,6 +1356,8 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // (What the guard block found, for the log of `VICTORY_INTRO_LOG`.)
+        let mut flags = if exact { 0x800 } else { 0 };
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1310,7 +1378,9 @@ impl Staging {
                 last.hot_until = frame + HOT_FRAMES;
             }
             let hot = hot_textures() && frame < last.hot_until;
+            flags |= if unwritten { 0x100 } else { 0 } | if hot { 0x200 } else { 0 } | if turn { 0x400 } else { 0 };
             if !exact && unwritten && !turn && !hot {
+                self.log(4, flags);
                 return 0;
             }
             blind = unwritten;
@@ -1351,6 +1421,7 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if !exact && last.partial.is_some_and(|at| frame < at + 30) {
+                self.log(5, flags);
                 return 0;
             }
             last.partial = Some(frame);
@@ -1379,6 +1450,7 @@ impl Staging {
             if changed {
                 found_blind(last);
             }
+            self.log(6, flags);
             return size;
         }
         let mut refresh_whole = |tiled: &[u8]| {
@@ -1389,6 +1461,9 @@ impl Staging {
                 found_blind(last);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                self.log(8, flags);
+            } else {
+                self.log(7, flags);
             }
             size
         };
@@ -1400,6 +1475,19 @@ impl Staging {
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         refresh_whole(tiled)
     }
+
+    /// For `VICTORY_INTRO_LOG` ([`crate::introlog`]): what a check of the
+    /// memory did.
+    #[cfg(feature = "diagnostics")]
+    fn log(&self, answer: u64, flags: u64) {
+        if self.read >= 1 << 20 {
+            crate::introlog::watch(self.memory as usize, self.read);
+            crate::introlog::note("refresh", self.memory as u64, self.read as u64, answer | flags);
+        }
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn log(&self, _answer: u64, _flags: u64) {}
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
@@ -1419,6 +1507,7 @@ impl Staging {
         });
         if read {
             UNLOCKED[0].fetch_add(1, Relaxed);
+            self.log(9, 0);
             size
         } else if last.hash.is_none() && fill_unlocked() {
             self.fill(last, size)
@@ -1481,6 +1570,7 @@ impl Staging {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         if !retry {
             self.dirty.store(true, Relaxed);
+            self.detiled_in.store(SUBMISSION.load(Relaxed), Relaxed);
         }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1527,6 +1617,7 @@ impl Staging {
                 self.detiled.store(held, Relaxed);
             }
             self.dirty.store(true, Release);
+            self.detiled_in.store(SUBMISSION.load(Relaxed), Relaxed);
         }
         true
     }
@@ -1996,6 +2087,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        detiled_in: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),
         on_demand,

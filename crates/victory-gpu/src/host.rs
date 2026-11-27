@@ -5679,6 +5679,7 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        crate::texture::next_submission();
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
@@ -9294,6 +9295,8 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             let presenting = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::introlog::note("shown", frame, 0, 0);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             PRESENT_US.fetch_add(presenting.elapsed().as_micros() as u64, Ordering::Relaxed);
             showing.next("the frame meter");

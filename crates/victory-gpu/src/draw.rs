@@ -2456,6 +2456,10 @@ impl State {
                     // least every `dynamic_look` frames, and for good
                     // ([`dynamic_look`]).
                     let dynamic = is_dynamic(index);
+                    #[cfg(feature = "diagnostics")]
+                    if len >= 1 << 20 {
+                        crate::introlog::note("look", u64::from(index), at as u64, frame << 32 | u64::from(looks) << 8 | u64::from(dynamic));
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
                             let wait = if dynamic { (*wait).min(dynamic_look()) } else { *wait };
@@ -2472,6 +2476,15 @@ impl State {
                     again_in = 1;
                 }
                 let times = found_changed(index);
+                #[cfg(feature = "diagnostics")]
+                if len >= 1 << 20 {
+                    crate::introlog::note(
+                        "look",
+                        u64::from(index),
+                        at as u64,
+                        frame << 32 | u64::from(looks) << 8 | 0x80 | u64::from(times) << 16 | again_in << 24,
+                    );
+                }
                 #[cfg(feature = "diagnostics")]
                 let cause = crate::watch::seen::cause(index, at as usize, len as usize, frame);
                 #[cfg(feature = "diagnostics")]
