@@ -527,6 +527,155 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
     Some(out)
 }
 
+/// `VICTORY_LOOP_SCALARS=0`: a console wave64 compute program of one console wave on a host of
+/// 32-lane waves whose divergent loops leave a scalar that is read per lane after them is no
+/// longer given the form with synchronized loop latches ([`scalar_loop_latches`]): each host
+/// wave then counts the scalar on its own, and every lane reads the count of its own iterations.
+/// Ported from Belobug/VIctory-Belobug-AMD PR #366. Part of the translation: the shader cache
+/// keys on it.
+pub(super) fn loop_scalars() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOOP_SCALARS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_SCALARS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`loop_scalars`], for its thread only.
+    pub(super) static TEST_LOOP_SCALARS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Loop latches that must run in step to preserve an SGPR read after a divergent
+/// exit. Only consider a forward path with properly nested EXEC back edges.
+/// Every loop then has a single entry and exit, and a nest that meets at a
+/// latch cannot be entered or re-entered by only part of the group.
+/// (Ported from Belobug/VIctory-Belobug-AMD PR #366.)
+pub(super) fn scalar_loop_latches(p: &crate::ir::Program, st: &Structured) -> HashSet<usize> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut positions = vec![usize::MAX; p.blocks.len()];
+    for (index, &block) in order.iter().enumerate() {
+        positions[block] = index;
+    }
+    let mut loops = Vec::new();
+    for (index, &block) in order.iter().enumerate() {
+        let next = order.get(index + 1).copied();
+        match st.exits[block] {
+            LaneExit::Jump(to) if next == Some(to) => {}
+            LaneExit::End if next.is_none() => {}
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if Some(not_taken) == next
+                && positions[taken] <= index
+                && p.blocks[block]
+                    .insts
+                    .last()
+                    .is_some_and(|i| i.name() == "s_cbranch_execnz") =>
+            {
+                loops.push((positions[taken], index));
+            }
+            _ => return HashSet::new(),
+        }
+    }
+    if loops.is_empty() {
+        return HashSet::new();
+    }
+
+    // Keep this form to ordinary scalar and lane-local vector instructions,
+    // and loads/stores without LDS or a wave-dependent address calculation.
+    // In particular, a lane read could make an apparently scalar write vary.
+    let is_mask = |v| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let ordinary_sgpr = |reg, value| matches!(reg, Reg::S(0..=105)) && !is_mask(value);
+    let mut last_use = HashMap::new();
+    for (index, &b) in order.iter().enumerate() {
+        let block = &p.blocks[b];
+        for phi in &block.phis {
+            for &arg in &phi.args {
+                last_use.insert(arg, index);
+            }
+        }
+        for inst in &block.insts {
+            let name = inst.name();
+            let local = match &inst.fields {
+                Fields::Sop { src, .. } => {
+                    !src.iter().any(|op| matches!(op, Operand::Const(251 | 252)))
+                }
+                Fields::Sopp { .. } => matches!(name, "s_branch" | "s_cbranch_execnz" | "s_endpgm"),
+                Fields::Smem { .. } => name.starts_with("s_load_"),
+                Fields::Buffer { lds: false, .. } => !name.contains("atomic"),
+                Fields::Valu(v) => {
+                    v.dpp.is_none()
+                        && !name.contains("lane")
+                        && !name.starts_with("v_mbcnt")
+                        && inst
+                            .writes
+                            .iter()
+                            .all(|&(reg, value)| !ordinary_sgpr(reg, value))
+                }
+                _ => false,
+            };
+            if !local || reads_mask_as_data(st, inst) {
+                return HashSet::new();
+            }
+            for &(_, read) in &inst.reads {
+                last_use.insert(read, index);
+            }
+        }
+    }
+
+    // Sort outer loops before their children, rejecting overlapping loops
+    // and multiple back edges to one header.
+    loops.sort_unstable();
+    let mut open = Vec::new();
+    for &(header, latch) in &loops {
+        while open.last().is_some_and(|&(_, end)| end < header) {
+            open.pop();
+        }
+        if open
+            .last()
+            .is_some_and(|&(start, end)| start == header || end <= latch)
+        {
+            return HashSet::new();
+        }
+        open.push((header, latch));
+    }
+    let mut wide = HashSet::new();
+    let mut remaining = loops.as_slice();
+    while let Some(&(_, last)) = remaining.first() {
+        let count = remaining.partition_point(|&(header, _)| header <= last);
+        let (nest, rest) = remaining.split_at(count);
+        let scalar_escapes = nest.iter().any(|&(header, latch)| {
+            let LaneExit::Branch { when, .. } = st.exits[order[latch]] else {
+                return false;
+            };
+            st.bools
+                .support(when)
+                .iter()
+                .any(|a| !matches!(a, Atom::Uniform(_)))
+                && order[header..=latch].iter().any(|&b| {
+                    p.blocks[b]
+                        .insts
+                        .iter()
+                        .flat_map(|i| &i.writes)
+                        .any(|&(reg, value)| {
+                            ordinary_sgpr(reg, value)
+                                && last_use.get(&value).is_some_and(|&at| at > latch)
+                        })
+                })
+        });
+        if scalar_escapes {
+            // A lane leaving an outer iteration must still reach the inner
+            // vote in the next iteration. Conversely, the inner vote must
+            // finish before the wave can make its outer loop decision.
+            wide.extend(nest.iter().map(|&(_, latch)| order[latch]));
+        }
+        remaining = rest;
+    }
+    wide
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {

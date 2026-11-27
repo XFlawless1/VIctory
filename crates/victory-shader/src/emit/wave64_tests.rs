@@ -1335,3 +1335,323 @@ fn a_branch_mask_keeps_both_words_on_the_card() {
     }
     eprintln!("ran on the hardware device: four thresholds, both words right in all 64 lanes");
 }
+
+// Divergent loops whose scalar is read per lane after them (Belobug/VIctory-Belobug-AMD PR #366,
+// issues #299 and #352). One console wave64 of 64 threads on a host of 32-lane waves, two host
+// waves: on the console the loop runs until the last lane is out and a scalar it counts holds the
+// wave's count in every lane afterwards; with per-lane control flow each lane read the count of
+// its own iterations. `VICTORY_LOOP_SCALARS=0` (here `lower::TEST_LOOP_SCALARS`) is the old form.
+
+/// `body` then a store of v0 at v10 * 4 (v10 keeps the thread id) to dword v10 of the raw UAV.
+fn scalar_loop_program(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+    let mut words = body.to_vec();
+    words.extend_from_slice(&[
+        0x3412_1482,                       // v_lshlrev_b32 v9, 2, v10
+        0x38 << 26 | 0x1C << 18 | 1 << 12, // buffer_store_dword v0, v9, s[8:11], 0 offen
+        0x80 << 24 | 2 << 16 | 9,
+    ]);
+    native_of(&words, wave64, threads)
+}
+
+/// The program through the whole of `emit` (its retries included) for a host of 32-lane waves.
+fn scalar_loop_emitted(
+    native: &NativeProgram,
+    loop_scalars: Option<bool>,
+) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, native).expect("IO");
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let before = lower::TEST_LOOP_SCALARS.replace(loop_scalars);
+    let result = super::emit(&container, native, &p, &st, &io, &res);
+    lower::TEST_LOOP_SCALARS.set(before);
+    lower::TEST_HOST_WAVE.set(was);
+    result
+}
+
+/// The loop latches `lower::scalar_loop_latches` selects in `native`.
+fn scalar_loop_latches_of(native: &NativeProgram) -> HashSet<usize> {
+    let p = crate::spill::build(native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    lower::scalar_loop_latches(&p, &st)
+}
+
+/// What the program stores for each of its `threads` threads, on the card (None without one
+/// that takes it), as translated with `loop_scalars` (None: the process's choice).
+fn scalar_loop_on_the_card(
+    native: &NativeProgram,
+    loop_scalars: Option<bool>,
+    threads: u32,
+) -> Option<Vec<u32>> {
+    let shader = scalar_loop_emitted(native, loop_scalars).expect("translation");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    whole_uav(&shader, [0, 0], threads)
+}
+
+/// A program the synchronized latches change: translated with them, every lane stores
+/// `expected`; translated as before (`VICTORY_LOOP_SCALARS=0`) it does not (each lane stores
+/// the count of its own iterations).
+fn scalar_loop_is_fixed(body: &[u32], expected: &[u32]) {
+    let n = expected.len() as u32;
+    let native = scalar_loop_program(body, true, n);
+    assert!(!scalar_loop_latches_of(&native).is_empty(), "no latch selected");
+    let on = scalar_loop_emitted(&native, Some(true)).expect("translation");
+    let off = scalar_loop_emitted(&native, Some(false)).expect("translation");
+    assert_ne!(on.dxil, off.dxil, "the switch changes nothing");
+    if let Some(got) = scalar_loop_on_the_card(&native, Some(true), n) {
+        assert_eq!(got, expected, "with the synchronized latches");
+        let Some(old) = scalar_loop_on_the_card(&native, Some(false), n) else {
+            return;
+        };
+        assert_ne!(old, expected, "the old form is right here: nothing to fix on this card");
+        eprintln!("old form: {old:?}\nnew form: {got:?}");
+    }
+}
+
+/// A program the synchronized latches leave alone: the same translation either way.
+fn scalar_loop_is_untouched(native: &NativeProgram, expected: Option<&[u32]>) {
+    let on = scalar_loop_emitted(native, Some(true)).expect("translation");
+    let off = scalar_loop_emitted(native, Some(false)).expect("translation");
+    assert_eq!(on.dxil, off.dxil, "the switch changes the translation");
+    if let Some(expected) = expected
+        && let Some(got) = scalar_loop_on_the_card(native, None, expected.len() as u32)
+    {
+        assert_eq!(got, expected);
+    }
+}
+
+#[test]
+fn a_divergent_scalar_loop_counts_for_the_whole_wave() {
+    // PR #299: each lane loops t + 1 times; s6 counts the iterations
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8106, // loop: s_add_i32 s6, s6, 1
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[64; 64],
+    );
+}
+
+/// The longest loop is in the second host wave, or in the first: the other one has to wait for it
+/// (trip counts 1 to 4 in one half, 6 to 9 in the other; s6 += 3 each iteration).
+#[test]
+fn both_host_waves_count_the_longest_loop_of_the_wave() {
+    for longer_first in [false, true] {
+        let mut body = vec![
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x3602_0083, // v_and_b32 v1, 3, v0
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x2C08_0085, // v_lshrrev_b32 v4, 5, v0: 0 in the first half, 1 in the second
+        ];
+        if longer_first {
+            body.push(0x3A08_0881); // v_xor_b32 v4, 1, v4
+        }
+        body.extend([
+            0x340A_0882, // v_lshlrev_b32 v5, 2, v4
+            0x4A02_0304, // v_add_nc_u32 v1, v4, v1
+            0x4A02_0305, // v_add_nc_u32 v1, v5, v1: 5 more in the longer half
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8306, // loop: s_add_i32 s6, s6, 3
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ]);
+        scalar_loop_is_fixed(&body, &[27; 64]);
+    }
+}
+
+#[test]
+fn nested_divergent_scalar_loops_count_for_the_whole_wave() {
+    // PR #299: the inner loop runs (t >> 4) + 1 times, the outer (t & 3) + 1 times
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x3602_0083, // v_and_b32 v1, 3, v0
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x2C08_0084, // v_lshrrev_b32 v4, 4, v0
+            0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE8C_0480, // s_mov_b64 s[12:13], 0
+            0x7E06_0304, // v_mov_b32 v3, v4
+            0x8106_8106, // s_add_i32 s6, s6, 1
+            0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+            0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+            0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+            0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+            0xBF89_FFFA, // s_cbranch_execnz inner
+            0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFF2, // s_cbranch_execnz outer
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[16; 64],
+    );
+}
+
+/// Two loops one after the other: the first loop's s6 goes on into the second (through a phi),
+/// and the second leaves two scalars.
+#[test]
+fn consecutive_divergent_loops_carry_their_scalars() {
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE87_038B, // s_mov_b32 s7, 11
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x8106_8106, // first loop: s6 += 1
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz first loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x3602_1483, // v_and_b32 v1, 3, v10
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x8106_8306, // second loop: s6 += 3, starting at the first loop's result
+            0x8107_8207, // s7 += 2
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFF9, // s_cbranch_execnz second loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x8106_0706, // s_add_i32 s6, s6, s7
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[64 + 3 * 4 + 11 + 2 * 4; 64],
+    );
+}
+
+/// What the synchronized latches leave alone: a loop every lane leaves together (a uniform
+/// exit), a loop whose only results are per lane, a loop of a console wave32.
+#[test]
+fn loops_without_a_per_lane_scalar_are_translated_as_before() {
+    // s6 counts to 4 in every lane
+    let uniform = scalar_loop_program(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8106, // loop: s_add_i32 s6, s6, 1
+            0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        true,
+        64,
+    );
+    assert!(scalar_loop_latches_of(&uniform).is_empty());
+    scalar_loop_is_untouched(&uniform, Some(&[4; 64]));
+    // each lane counts its own iterations in a vector register, nothing scalar leaves the loop
+    let vector_only = scalar_loop_program(&scalar_loop_vector_body(false), true, 64);
+    assert!(scalar_loop_latches_of(&vector_only).is_empty());
+    let want: Vec<u32> = (1..=64).collect();
+    scalar_loop_is_untouched(&vector_only, Some(&want));
+    // a console wave32 (the scalar is the wave's own: one host wave)
+    let wave32 = scalar_loop_program(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x7E16_0280, // v_mov_b32 v11, 0
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x4A16_1681, // loop: v_add_nc_u32 v11, 1, v11
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E00_030B, // v_mov_b32 v0, v11
+        ],
+        false,
+        32,
+    );
+    assert!(scalar_loop_latches_of(&wave32).is_empty());
+    scalar_loop_is_untouched(&wave32, Some(&(1..=32).collect::<Vec<u32>>()));
+}
+
+/// A scalar shared by the lanes and a lane-local vector count: the scalar is the wave's, the
+/// vector each lane's own (v0 = v11 + s6).
+fn scalar_loop_vector_body(shared: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+    ];
+    if shared {
+        body.extend([0xBE86_0387, 0x8106_8306]); // s6 = 7; loop: s6 += 3
+    }
+    body.extend([
+        0x4A16_1681, // v_add_nc_u32 v11, 1, v11
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        if shared { 0xBF89_FFF9 } else { 0xBF89_FFFA },
+        0x88FE_027E,                                    // s_or_b64 exec, exec, s[2:3]
+        if shared { 0x4A00_1606 } else { 0x7E00_030B }, // v0 = v11 + s6 or v11
+    ]);
+    body
+}
+
+#[test]
+fn a_shared_scalar_and_a_lane_local_vector_count_each_their_own() {
+    let want: Vec<u32> = (1..=64).map(|t| 7 + 3 * 64 + t).collect();
+    scalar_loop_is_fixed(&scalar_loop_vector_body(true), &want);
+}
+
+/// The synchronized latches are for one console wave in the group (two host waves): a group of
+/// two console waves is translated as before, whatever the loops hold.
+#[test]
+fn groups_of_several_console_waves_keep_their_translation() {
+    let native = scalar_loop_program(&scalar_loop_vector_body(true), true, 128);
+    assert_eq!(scalar_loop_latches_of(&native).len(), 1);
+    scalar_loop_is_untouched(&native, None);
+}
+
+/// A skip around the loop (some lanes never enter it) is a shape the synchronized latches do not
+/// take.
+#[test]
+fn a_loop_behind_a_skip_is_translated_as_before() {
+    let body = scalar_loop_vector_body(true);
+    let mut words = vec![
+        0x7D88_00A0,                           // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8C_246A,                           // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | (body.len() + 3) as u32, // s_cbranch_execz past body and store to s_endpgm
+    ];
+    words.extend(body);
+    let native = scalar_loop_program(&words, true, 64);
+    assert!(scalar_loop_latches_of(&native).is_empty());
+    scalar_loop_is_untouched(&native, None);
+}

@@ -122,6 +122,7 @@ fn build() -> [u8; 32] {
             "VICTORY_LANE_UNIFORM",
             "VICTORY_THREAD_TICKETS",
             "VICTORY_EMPTY_MASK_OR",
+            "VICTORY_LOOP_SCALARS",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",

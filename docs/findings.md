@@ -273,3 +273,20 @@ before: 0 of 25,689 programs change. The four programs the title still drops eac
 `alphaResolve:CS_AlphTransmissionPrefilterMip`, `vfx_triangleClip:CS_DefragHeap_ComputeRelocations`,
 `sr_tracing:CS_Tiling_Generate_Opaque`) end in a 64-lane form with other reasons ("LDS in a group over 32, an LDS read and
 write in one lane-branch region", `v_readlane`, a mask read as data), and stay refused by the card (`0x80070057`).
+
+**Divergent loops that leave a scalar take synchronized latches (Belobug #366, draft; `VICTORY_LOOP_SCALARS=0` is the old
+behaviour; no measured effect on the title, `TRANSLATOR_VERSION` stays 3).** A console wave64 program of one console wave (a
+group of exactly 64 threads, no LDS) on a host whose waves are at most 32 lanes, with EXEC loops that leave a scalar read per
+lane after them, counted that scalar once in each host wave, so every lane read the count of its own host wave's iterations (or
+of its own, with per-lane loop exits). `lower::scalar_loop_latches` (the PR's analysis, as it is) picks such programs and the
+latches of their loops are then decided by the whole wave (`structure_wide`: both host waves vote, two group barriers a
+latch); `emit` takes that form first and does not retry the program in the per-half forms. Taken without the PR's test that
+starts its own test binary again to read `VICTORY_GROUP_SYNC=0`: that refusal is kept and untested. Eight card tests: the PR's
+fixtures and two of ours with the longest loop in the second or in the first host wave, the program, translated with the
+switch off, giving per-lane counts and with it the wave's: a divergent loop of t + 1 iterations 1..64 -> 64 in every lane;
+nested loops 1, 2, 3, 4, ... -> 16; two loops in a row through a phi, 17, 23, 29, ... -> 95; a shared scalar beside a lane-local
+count 11, 15, 19, ... -> 200, 201, ...; ours, 3, 6, 9, 12, ... -> 27 and 18, 21, 24, 27, ... -> 27. Controls with the same
+translation either way: a uniform exit, a loop with only per-lane results, a console wave32, a group of two console waves, a
+loop behind a skip. **Census: 0 of 25,689 programs change** (this port and the one before it, against the first commit's
+build): the PR's conditions are narrow (one console wave, no LDS, nothing but plain scalar and lane-local vector
+instructions, nested loops with one entry and one exit), and no program of the pack meets them here.
