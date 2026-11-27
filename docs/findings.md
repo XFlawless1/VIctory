@@ -258,3 +258,18 @@ here 8 x 8 programs of console wave64 already took it, none of those three famil
 and so nothing here links this change to the blocky shadows. What is not shown: that any of the four was wrong before (the
 shapes the card gets wrong, 32-wide rows, are not among the title's programs here). World runs of this build are with those of
 the last port, below.
+
+**A skip that only ORs an empty compare into a saved mask may go (Belobug #345; `VICTORY_EMPTY_MASK_OR=0` is the old
+behaviour; no measured effect, `TRANSLATOR_VERSION` stays 3).** `ir::without_skips` (the deep form of a console wave64
+program on waves of 32) now also takes an `s_cbranch_execz` skip whose region is one `v_cmp` and an `s_or_b64` of VCC into a
+saved mask: with no lane left both VCC dwords are zero, so the OR changes nothing, and the program stops being refused with
+"a lane mask holding lanes elsewhere read as data". The PR's ir.rs hunk is taken as it is; its test hunk does not apply here
+and is written again, and a wave64 program with card readbacks of both mask words at four thresholds replaces the PR's
+(refused without the change, translates with it; all four thresholds right on the card). **On the title's pack it does
+nothing:** `VICTORY_WAVE_WHY=1` over the whole pack (69,355 lines, every form each program is tried in) never prints that
+refusal text (0 times); the nearest, "a lane mask exchanged where not every lane runs", is 138 refusals of forms, none of
+which leaves a program untranslated (the 319 failures above are of other kinds). The census of the build with it (together with the next port) is byte for byte the one
+before: 0 of 25,689 programs change. The four programs the title still drops each frame (`GpuParticleUpdate:CS_Visibility`,
+`alphaResolve:CS_AlphTransmissionPrefilterMip`, `vfx_triangleClip:CS_DefragHeap_ComputeRelocations`,
+`sr_tracing:CS_Tiling_Generate_Opaque`) end in a 64-lane form with other reasons ("LDS in a group over 32, an LDS read and
+write in one lane-branch region", `v_readlane`, a mask read as data), and stay refused by the card (`0x80070057`).

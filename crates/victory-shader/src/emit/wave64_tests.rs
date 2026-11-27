@@ -1255,3 +1255,83 @@ fn the_old_rounding_of_console_threads_on_this_card() {
     }
     eprintln!("rounding: {} of {} shapes wrong on the card: {bad:#?}", bad.len(), SHAPES_32.len());
 }
+
+/// A saved mask updated inside a divergent branch and read, both words, after the join (Belobug
+/// PR #345): `s[2:3] = lanes below 5; if (t >= s1) { s[2:3] |= lanes below 55 }`, then both
+/// dwords are stored per lane. With no lane left for the branch the OR changes nothing (the
+/// comparison clears both dwords of VCC), so the skip may go (`ir::without_skips`, deep) and
+/// the program translates in an exact form; without it the program is refused ("a lane mask
+/// holding lanes elsewhere read as data"). `VICTORY_EMPTY_MASK_OR=0`, here the test's choice
+/// of `ir::TEST_EMPTY_MASK_OR`, is the refusal.
+fn branch_mask_program() -> NativeProgram {
+    native(&[
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: bits 0..4
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        0x7D86_0001, // v_cmp_le_u32 vcc, s1, v0: lanes at or above the threshold
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B7, // v_cmp_gt_u32 vcc, 55, v0: add active lanes below 55
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
+        0x7E08_0202, // v_mov_b32 v4, s2
+        0x7E0A_0203, // v_mov_b32 v5, s3
+        0x3412_0083, // v_lshlrev_b32 v9, 3, v0
+        0xE070_1000,
+        0x8002_0409, // buffer_store_dword v4, v9, s[8:11], 0 offen
+        0xE070_1004,
+        0x8002_0509, // buffer_store_dword v5, v9, s[8:11], 0 offen offset:4
+    ])
+}
+
+/// [`branch_mask_program`] through the whole of `emit` (its retries included) for a host of
+/// 32-lane waves, with `empty_mask_or` as the test's choice for `VICTORY_EMPTY_MASK_OR`.
+fn branch_mask_emitted(empty_mask_or: bool) -> Result<HostShader, ShaderError> {
+    let native = branch_mask_program();
+    let p = crate::spill::build(&native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("IO");
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let before = ir::TEST_EMPTY_MASK_OR.replace(Some(empty_mask_or));
+    let result = super::emit(&container, &native, &p, &st, &io, &res);
+    ir::TEST_EMPTY_MASK_OR.set(before);
+    lower::TEST_HOST_WAVE.set(was);
+    result
+}
+
+#[test]
+fn a_branch_mask_is_refused_without_the_empty_mask_or_and_translates_with_it() {
+    let Err(refused) = branch_mask_emitted(false) else {
+        panic!("translated without the empty mask OR");
+    };
+    assert!(refused.to_string().contains("holding lanes elsewhere"), "{refused}");
+    let shader = branch_mask_emitted(true).expect("translation with the empty mask OR");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
+
+#[test]
+fn a_branch_mask_keeps_both_words_on_the_card() {
+    let shader = branch_mask_emitted(true).expect("translation");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (threshold, expected) in [
+        (0, [u32::MAX, 0x007f_ffff]),     // all lanes enter
+        (32, [0x0000_001f, 0x007f_ffff]), // only the upper half enters
+        (48, [0x0000_001f, 0x007f_0000]), // only the top 16 enter
+        (64, [0x0000_001f, 0]),           // no lane enters; the old mask survives
+    ] {
+        let Some(out) = whole_uav(&shader, [0, threshold], 128) else {
+            return;
+        };
+        for (lane, pair) in out.chunks_exact(2).enumerate() {
+            assert_eq!(pair, expected, "threshold {threshold}, lane {lane}");
+        }
+    }
+    eprintln!("ran on the hardware device: four thresholds, both words right in all 64 lanes");
+}
