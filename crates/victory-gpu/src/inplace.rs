@@ -273,11 +273,13 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Of those, how many are shown more than once.
     pages_twice: usize,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed. By the
+    /// thousand when the runtime makes its physical pages in sections of
+    /// 2 MiB (`VICTORY_SECTION_MB`), so not a list searched at every write.
+    sections: BTreeMap<usize, (u64, bool)>,
     /// Our own view of a whole section, by its handle (0: the host gave
     /// none), made when first asked for ([`beside`]) and kept.
-    whole: Vec<(usize, usize)>,
+    whole: BTreeMap<usize, usize>,
 }
 
 /// Read by many threads at once (write faults, landings), changed when the
@@ -286,8 +288,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
     pages_twice: 0,
-    sections: Vec::new(),
-    whole: Vec::new(),
+    sections: BTreeMap::new(),
+    whole: BTreeMap::new(),
 });
 
 fn views() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -302,20 +304,20 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views_mut();
-    v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
-    v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    v.whole.remove(&section);
+    v.sections.insert(section, (bytes, committed));
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
-/// sees is of it any more, and [`beside`]'s view goes.
+/// sees is of it any more, and [`beside`]'s view goes (and the handle is no
+/// longer one to open a view of).
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
-        let at = v.whole.iter().position(|w| w.0 == section);
-        at.map(|i| v.whole.swap_remove(i).1)
+        v.sections.remove(&section);
+        v.whole.remove(&section)
     };
     if let Some(base) = whole.filter(|&base| base != 0) {
         // SAFETY: a view of ours. Who writes through it found the section
@@ -539,7 +541,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
             return None;
         };
-        v.whole.iter().find(|w| w.0 == section).map(|w| (w.1, offset))
+        v.whole.get(&section).map(|&base| (base, offset))
     };
     if let Some((base, offset)) = known {
         return (base != 0).then(|| base + offset as usize);
@@ -548,17 +550,17 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
         return None;
     };
-    let base = match v.whole.iter().find(|w| w.0 == section) {
-        Some(w) => w.1,
+    let base = match v.whole.get(&section) {
+        Some(&base) => base,
         None => {
-            let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+            let &(bytes, _) = v.sections.get(&section)?;
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
             if base == 0 {
                 tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
             }
-            v.whole.push((section, base));
+            v.whole.insert(section, base);
             base
         }
     };
@@ -579,11 +581,11 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
                 return None;
             }
             let offset = offset + within as u64;
-            if let Some(whole) = v.whole.iter().find(|w| w.0 == section) {
+            if let Some(&whole) = v.whole.get(&section) {
                 let mut shown = [0; 8];
                 let all = v.pages.get(&(section, offset))?;
                 shown.get_mut(..all.len())?.copy_from_slice(all);
-                return (whole.1 != 0).then(|| (whole.1 + offset as usize, shown));
+                return (whole != 0).then(|| (whole + offset as usize, shown));
             }
         }
         if asked || beside(page, K64).is_none() {
@@ -1145,9 +1147,16 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    // One line for each size (there are thousands of sections when the
+    // runtime cuts its pages in 2 MiB ones, `VICTORY_SECTION_MB`).
+    let mut sizes: BTreeMap<(u64, bool), usize> = BTreeMap::new();
+    for &(bytes, committed) in v.sections.values() {
+        *sizes.entry((bytes, committed)).or_default() += 1;
+    }
+    for ((bytes, committed), n) in sizes {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {n} section{} of {} MB, {}",
+            if n == 1 { "" } else { "s" },
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
@@ -1333,6 +1342,61 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// The runtime may make its physical pages in many small sections
+    /// (`VICTORY_SECTION_MB`): each is its own handle with its own whole
+    /// view, a range across two of them is not one run, and a section let
+    /// go is no handle to open a view of any more.
+    #[test]
+    fn many_small_sections_each_have_a_view_of_their_own() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        const SECTION: usize = 2 << 20;
+        let at = 0x7_9000_0000usize;
+        let made: Vec<usize> = (0..3)
+            .map(|_| {
+                // SAFETY: plain section creation.
+                let handle = unsafe {
+                    mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SECTION as u32, std::ptr::null())
+                };
+                assert!(!handle.is_null());
+                title_memory_section(handle as usize, SECTION as u64, true);
+                handle as usize
+            })
+            .collect();
+        // Each section's first four pages, one after the other in address.
+        for (k, &section) in made.iter().enumerate() {
+            title_memory_view(at + k * 4 * K64, 4 * K64, section, 0);
+        }
+        let mine: Vec<usize> = (0..3).map(|k| beside(at + k * 4 * K64, K64).expect("a view of the section beside")).collect();
+        assert!(mine.windows(2).all(|w| w[0] != w[1]));
+        // SAFETY: committed bytes of three views of ours of three sections.
+        unsafe {
+            for (k, &view) in mine.iter().enumerate() {
+                (view as *mut u8).write(10 + k as u8);
+            }
+            for (k, &view) in mine.iter().enumerate() {
+                assert_eq!((view as *const u8).read(), 10 + k as u8, "section {k}'s own bytes");
+            }
+        }
+        // Four pages of the first and one of the second are not one run of
+        // one section, nor are two of the second and third.
+        assert_eq!(cover(at, 5 * K64), Cover::Scattered);
+        assert_eq!(cover(at + 7 * K64, 2 * K64), Cover::Scattered);
+        assert!(beside(at + 3 * K64, 2 * K64).is_none());
+        // The second let go: no view beside it (its handle may be another's
+        // by now), the others as they were.
+        title_memory_section_gone(made[1]);
+        assert!(beside(at + 4 * K64, K64).is_none());
+        assert_eq!(beside(at, K64), Some(mine[0]));
+        assert_eq!(beside(at + 8 * K64, K64), Some(mine[2]));
+        views_gone(at, 12 * K64);
+        title_memory_section_gone(made[0]);
+        title_memory_section_gone(made[2]);
+        for &handle in &made {
+            // SAFETY: our handle.
+            unsafe { CloseHandle(handle as _) };
+        }
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
