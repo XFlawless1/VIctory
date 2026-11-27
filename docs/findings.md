@@ -263,3 +263,127 @@ b4ba4bbb, bf7833a9, 9576c45f (the ambient stand-in settling by the clock, "rooms
 seconds after walking in"): conflicts in `descriptor/host.rs` and `host.rs`. The host-copy refresh, heap-record, guard
 and renderer-port commits are another piece of work's; FidelityFX, RX 9070 XT, output and scale switches, the frame
 rate switch and the cache-core affinity are not wanted.
+
+## Ports from Belobug's pull requests and from kelvaroq (2026-11-27)
+
+Five changes ported by hand from third-party code (Belobug/VIctory-Belobug-AMD pull requests #442, #345 and #366;
+stellarr-studio/kelvaroq patches 0033 with the mask pieces of 0047, and 0052; all GPL-3.0-or-later), each its own commit with
+a switch, a card test and a census. The census is `VICTORY_HOST_WAVE=32 victory translate <shaders.rpf> --list --validate
+--jobs 8` (26,084 programs, 25,689 distinct translations, about 100 s) before and after, compared by the emitted hash of
+each distinct translation. 319 of the distinct programs do not come out whole, before and after every commit (195 "resources:
+an address in an SGPR that is no root parameter", 119 emitted but refused by the validator, 5 "a descriptor read only as
+data"); the 25,570 that validate still do after each. Tests: `cargo test -p victory-shader --lib` was 295 passed, 4
+ignored at a3892b0f.
+
+**Console threads of 2-D and 3-D groups from the wave counter (Belobug #442; `VICTORY_THREAD_TICKETS=0` is the old
+translation; `TRANSLATOR_VERSION` 3).** A console-lane program in a group of more than one host wave took its console thread
+from its host wave's first flat id rounded down to the wave size, exact only while each host wave holds an aligned run of
+flat ids. It now takes a block of the group's LDS counter (`wave_base`, which only console wave64 programs on waves of 32
+used), and a partial wave takes the last block, not any (the PR's second fix; groups of one host wave are left as they were).
+The test (`console_threads_of_multidimensional_groups_are_one_each`: each thread adds 1 + its console wave's first id at its
+own id) shows the bug on this RTX 5080: the old rounding is wrong for 7 of 12 shapes, 32 x 2 (64 of 64 dwords), 32 x 2 x 2
+(128 of 128), 32 x 4 x 2 (256 of 256), 10 x 10 (64 of 100), 12 x 12 (96 of 144), 24 x 8 (128 of 192) and 6 x 6 (8 of 36), and
+exact for 8 x 8, 4 x 4 x 4, 16 x 16, 8 x 8 x 2 and 16 x 2 x 4. With the counter all 26 runs on the card (13 shapes, console
+wave32 and wave64 on waves of 32) are exact, and with `VICTORY_THREAD_TICKETS=0` the test fails (first at 32 x 2).
+Tests 295 -> 298, `victory-gpu` 389 -> 389. **Census: 4 programs change**, `terrainshadows:CS_ComputeTerrainVisibility`,
+`scattering_transmittance_system:CS_GatherRaymarchedLocalLights`, `TAA2:CS_TAA2_Resolve` and `TAA2U:CS_TAA2_Resolve`
+(`VICTORY_WAVE_WHY=1` prints `THREAD-TICKETS` for the programs that take the counter: three 8 x 8 groups of console wave32
+programs, which the old rounding numbered right on this card, and one group of 36 threads whose partial wave takes the last
+block). All four validate and make their host pipelines on the card before and after. The PR's census (88 console wave32 8 x 8
+programs, among them `cascadeshadows_processing`, `rtdirectionalshadows` and `shadowmask`) was of a tree without a counter;
+here 8 x 8 programs of console wave64 already took it, none of those three families changes (6, 40 and 32 distinct programs),
+and so nothing here links this change to the blocky shadows. What is not shown: that any of the four was wrong before (the
+shapes the card gets wrong, 32-wide rows, are not among the title's programs here). World runs of this build are with those of
+the last port, below.
+
+**A skip that only ORs an empty compare into a saved mask may go (Belobug #345; `VICTORY_EMPTY_MASK_OR=0` is the old
+behaviour; no measured effect, `TRANSLATOR_VERSION` stays 3).** `ir::without_skips` (the deep form of a console wave64
+program on waves of 32) now also takes an `s_cbranch_execz` skip whose region is one `v_cmp` and an `s_or_b64` of VCC into a
+saved mask: with no lane left both VCC dwords are zero, so the OR changes nothing, and the program stops being refused with
+"a lane mask holding lanes elsewhere read as data". The PR's ir.rs hunk is taken as it is; its test hunk does not apply here
+and is written again, and a wave64 program with card readbacks of both mask words at four thresholds replaces the PR's
+(refused without the change, translates with it; all four thresholds right on the card). **On the title's pack it does
+nothing:** `VICTORY_WAVE_WHY=1` over the whole pack (69,355 lines, every form each program is tried in) never prints that
+refusal text (0 times); the nearest, "a lane mask exchanged where not every lane runs", is 138 refusals of forms, none of
+which leaves a program untranslated (the 319 failures above are of other kinds). The census of the build with it (together with the next port) is byte for byte the one
+before: 0 of 25,689 programs change. The four programs the title still drops each frame (`GpuParticleUpdate:CS_Visibility`,
+`alphaResolve:CS_AlphTransmissionPrefilterMip`, `vfx_triangleClip:CS_DefragHeap_ComputeRelocations`,
+`sr_tracing:CS_Tiling_Generate_Opaque`) end in a 64-lane form with other reasons ("LDS in a group over 32, an LDS read and
+write in one lane-branch region", `v_readlane`, a mask read as data), and stay refused by the card (`0x80070057`).
+
+**Divergent loops that leave a scalar take synchronized latches (Belobug #366, draft; `VICTORY_LOOP_SCALARS=0` is the old
+behaviour; no measured effect on the title, `TRANSLATOR_VERSION` stays 3).** A console wave64 program of one console wave (a
+group of exactly 64 threads, no LDS) on a host whose waves are at most 32 lanes, with EXEC loops that leave a scalar read per
+lane after them, counted that scalar once in each host wave, so every lane read the count of its own host wave's iterations (or
+of its own, with per-lane loop exits). `lower::scalar_loop_latches` (the PR's analysis, as it is) picks such programs and the
+latches of their loops are then decided by the whole wave (`structure_wide`: both host waves vote, two group barriers a
+latch); `emit` takes that form first and does not retry the program in the per-half forms. Taken without the PR's test that
+starts its own test binary again to read `VICTORY_GROUP_SYNC=0`: that refusal is kept and untested. Eight card tests: the PR's
+fixtures and two of ours with the longest loop in the second or in the first host wave, the program, translated with the
+switch off, giving per-lane counts and with it the wave's: a divergent loop of t + 1 iterations 1..64 -> 64 in every lane;
+nested loops 1, 2, 3, 4, ... -> 16; two loops in a row through a phi, 17, 23, 29, ... -> 95; a shared scalar beside a lane-local
+count 11, 15, 19, ... -> 200, 201, ...; ours, 3, 6, 9, 12, ... -> 27 and 18, 21, 24, 27, ... -> 27. Controls with the same
+translation either way: a uniform exit, a loop with only per-lane results, a console wave32, a group of two console waves, a
+loop behind a skip. **Census: 0 of 25,689 programs change** (this port and the one before it, against the first commit's
+build): the PR's conditions are narrow (one console wave, no LDS, nothing but plain scalar and lane-local vector
+instructions, nested loops with one entry and one exit), and no program of the pack meets them here.
+
+**An empty lane mask reads as 0, and a copy of an entry mask is ballotted at its source (kelvaroq 0033 and the mask pieces of
+0047; `VICTORY_WAVE_ZERO_MASK=0` is the old behaviour; `TRANSLATOR_VERSION` 4).** In a console wave64 program run as two host
+waves, a mask read as a number needs both waves to ballot it where every lane runs. A mask that is identically empty
+(`s_xor_b64 s[14:15], exec, exec`) now reads as 0 in both dwords whatever the other wave does (0033; `Bool::FALSE`), and a
+mask a lane branch copies (`s_mov_b64`, or `s_and_b64` / `s_or_b64` of one value with itself) from one written in the entry
+block is ballotted there (0047's `entry_mask_copied_by`). Not taken from 0047: the signature order, the 0x218 stub and the
+diagnostics. Changed from the patches: the empty-mask shortcut also asks for `Structured::active` (a complement of a mask
+has a FALSE lane bit where it is written and is not zero), and both pieces are behind the one switch, on by default (0033 has
+its piece off by default, 0047 on). The test (a mask read in a lane branch, both dwords stored per lane): the empty mask and the
+copy of EXEC are refused with the switch off and translate with it, a mask only some lanes hold is still refused, and both
+give the right word on the card for 1, 32, 40 and 64 lanes. **Census: 9 programs change**, eight tiled cascade shadow
+rasterizers, `cascadeshadows_rendering:CS_ShadowRenderTiledMisc`, `...MiscCB`, `...MiscCBPPPC`, `...MiscAlpha`,
+`...MiscAlphaPPPC`, `...MiscHair`, `...MiscHairPPPC`, `...MiscPPPC`, and `sr_tracing:CS_RayPrePass_Alpha`. All validate and
+make their host pipelines on the card (9 of 9 before and after). They are not rescued: with the switch off and on each is
+translated in the same last form (the one without skips, scalars followed, waves of 32; the two before it are refused with the
+same texts at the same places), so the change is inside that form, in how a mask read as a number is made where it is
+provably empty or copied. That the nine come out the same on the card was not checked program by program (nothing here runs them
+against a reference), and the pictures of two runs are not comparable pixel by pixel.
+
+**Two guest lanes in each host lane (kelvaroq 0052; `VICTORY_WAVE64_PAIRED=1` turns it on, off by default; with it off the
+output is the previous commit's, so no `TRANSLATOR_VERSION` change).** A last retry for a console wave64 compute program on a
+host of at most 32-lane waves that no other form of this tree gives 32 lanes (or whose form needs lanes of the other host
+wave): `bitcode/paired.rs` rewrites the finished module so that host lane 7 carries guest lanes 7 and 39 (every value twice),
+threads / 2, ballots, lane reads, any/all, prefix and reduction taken over both copies, the guest threads numbered by a counter
+at entry, an LDS fence before each LDS access, and every branch that closes an IR block taken by the whole guest wave
+(`emit_paired` makes them `structure_wide`); it needs complete guest waves (a group of a multiple of 64, and with several waves
+`VICTORY_GROUP_SYNC` not 0) and refuses anything else (`VICTORY_WAVE_WHY=1` prints why). Taken as it is (`paired.rs`,
+`paired_tests.rs`, the hooks), hand-merged into `run()` and `emit`; `thread_tickets` is off inside it. Tests: the patch's five on
+the card (an OR over the wave for 0, 1, 31, 32, 33, 63 and 64 live lanes; LDS shared between lanes and between two guest waves
+(64 and 128 threads) with masked stores at four limits; a lane gather and a first active lane at four thresholds; the retry
+taking only the refused width; the group shapes admitted) and ours: lane ranks of `lane & 3 == 1` by `v_mbcnt_lo` and
+`v_mbcnt_hi` of the compare's mask (slot r holds lane 4 r + 1), which crosses both halves, right in the paired form and in the
+exchanged form this tree has for it. `victory-shader` 295 -> 315 passed in the full run through this port (4 ignored), the
+lane-rank test run alone after it. **Census with the switch off: 0 of 25,689 programs change. With it on: 28 compute programs
+change** (all validate): `GpuParticleEmit` 7 (`CS_Emit_Dynamic_Model*`, `CS_EmitCounts_Dynamic_Edge`),
+`GpuParticleUpdate:CS_Visibility`, `shadowmask` 2 (`CS_GenerateShadowMasks_SampleHairScreenSpace`, `...HairOnly...`),
+`sr_tracing:CS_Tiling_Generate_Opaque`, `vfx_proj_decal_trail` 9, `vfx_triangleClip` 3 (`CS_DefragHeap_ComputeRelocations`,
+`CS_CollectTriangles`, `CS_CollectTriangles_Meshlets`) and `water_shading` 5 (`CS_TransmissionVolumetrics`, `...Submerged`,
+`..._Tiled`, `..._Tiled_LocalLights`, `..._VolumePortalsOnly`). Their host pipelines (`victory translate --pipelines`): 0 of 28
+without the switch (every one `The parameter is incorrect`, 64 lanes the card does not run), 28 of 28 with it.
+
+**What the switch does in the title's world (RTX 5080, Series S, 240 s to the prison cell; `run_game_repo.ps1`).** Default
+builds log the card's refusal of 7 compute programs and drop 1.0 dispatch a frame of each of four, `GpuParticleUpdate:CS_Visibility`
+(369cbe90), `vfx_triangleClip:CS_DefragHeap_ComputeRelocations` (02384a60), `sr_tracing:CS_Tiling_Generate_Opaque` (2cc4c197) and
+`alphaResolve:CS_AlphTransmissionPrefilterMip` (2da4beb3); the other three refused (`CS_CollectTriangles_Meshlets`, the two
+water `..._Tiled*`) are made rarely. With the switch on, **three of the four run** (no refusal, no drop logged for them, nor for
+the other three), and `alphaResolve:CS_AlphTransmissionPrefilterMip` is still refused (1.0 a frame in each of about 30 log lines of each run),
+as the patch's author saw on another card (that program is not among the 28). The frame lines' own "dropped" count (about 265
+in the world: 263 against 265 with and without it) does not change. World frame, the
+median of the world lines (3,500+ draws a frame) after the first 12 of them, in ms: with the switch on 45.9, 41.8 and 42.0 (three
+runs, 19 to 25 world lines each, ranges 44.9-46.5, 41.1-46.2, 40.8-44.2); default, final build 47.4 (one run); the first-commit
+build 49.7 (a first run of that build, 10 world lines) and 46.5. The same recipe gave 41.0 to 49.0 ms on this PC for the base
+tree earlier today (41.2, 45.1 and 49.0 in `prep_r1-3`; 41.0 in `belo_r3` and `belo_r4` after the first 12 lines), so these
+numbers show no slowdown but no speed-up either: no run of the base build was made beside them (the machine's queue was long),
+and a run is warmer than the one before (shader and driver caches), the first of a build the coldest. No run ended before its time, none
+logs a device removal, a panic or an access violation (the patch's author reported one crash of two paired runs, at 216 s, on
+a different card and system). The frames captured at 4,800 show the same scene with and without the switch (camera and
+animation differ between runs; no black-and-red blocks on the jumpsuit in either, which that author saw by eye without it);
+nothing here shows a picture difference, and no frame cost of the paired form shows in these runs.

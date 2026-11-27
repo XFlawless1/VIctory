@@ -1105,3 +1105,618 @@ fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
     };
     assert!(error.to_string().contains("a first-lane read where not every lane runs"), "{error}");
 }
+
+/// Console lanes in a 2-D or 3-D group of more than one host wave (Belobug/VIctory-Belobug-AMD
+/// #216, PR #442). Each thread computes its flat id f from v0..v2 (`TIDIG_COMP_CNT` 2), reads lane
+/// 0's (`v_readlane`, so the program gets console lanes) and adds that + 1 to dword f. As on the
+/// console, every dword gets exactly one add, of 1 + its console wave's first id. A GPU need not
+/// fill such a group in aligned runs of flat ids (NVIDIA's 8 x 8 groups, 2 x 2 quads on AMD), and
+/// rounding a host wave's first flat id down to the wave size then gave two waves the same ids.
+fn flat_id_adds(threads: [u32; 3], wave64: bool) -> NativeProgram {
+    let [x, y, _] = threads;
+    let body = [
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD569_0005,
+        0x0001_FF01,
+        x, // v_mul_lo_u32 v5, v1, X
+        0xD569_0006,
+        0x0001_FF02,
+        x * y,       // v_mul_lo_u32 v6, v2, XY
+        0x4A08_0B00, // v_add_nc_u32 v4, v0, v5
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0xD760_000C,
+        0x0001_0104, // v_readlane_b32 s12, v4, 0
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+        0xE0C8_1000,
+        0x8002_0203, // buffer_atomic_add v2, v3, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&body, wave64, 1);
+    // (thread ids x, y and z in v0..v2)
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 2 << 11,
+        threads,
+    });
+    native
+}
+
+/// [`flat_id_adds`] lowered for host waves of `host_wave` lanes, with `tickets` as the test's
+/// choice for `VICTORY_THREAD_TICKETS` (None: the process's), and validated if `dxil.dll` is there.
+fn flat_id_adds_lowered(
+    threads: [u32; 3],
+    wave64: bool,
+    host_wave: u32,
+    tickets: Option<bool>,
+) -> Result<HostShader, String> {
+    let native = flat_id_adds(threads, wave64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let before = lower::TEST_TICKETS.replace(tickets);
+    let shader = lowered_on(&native, &p, &HashSet::new(), host_wave);
+    lower::TEST_TICKETS.set(before);
+    let shader = shader.map_err(|e| format!("{e:?}"))?;
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(shader)
+}
+
+/// The adds of [`flat_id_adds`] on the hardware device (None without one that takes the
+/// program), and what each dword must hold.
+fn flat_id_adds_on_the_card(
+    shader: &HostShader,
+    threads: [u32; 3],
+    wave64: bool,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let w: u32 = if wave64 { 64 } else { 32 };
+    let n: u32 = threads.iter().product();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let out = whole_uav(shader, [0, 0], n)?;
+    Some((out, (0..n).map(|t| 1 + (t & !(w - 1))).collect()))
+}
+
+/// Group shapes of more than one host wave: the 2-D and 3-D ones of the title's console wave32
+/// programs (8 x 8 and 4 x 4 x 4 at 32 lanes are 88 + 2 programs of its archive), and shapes
+/// whose last host wave is partial.
+const SHAPES_32: [[u32; 3]; 12] = [
+    [32, 2, 1],
+    [8, 8, 1],
+    [4, 4, 4],
+    [32, 2, 2],
+    [16, 16, 1],
+    [8, 8, 2],
+    [16, 2, 4],
+    [10, 10, 1],
+    [12, 12, 1],
+    [24, 8, 1],
+    [6, 6, 1],
+    [32, 4, 2],
+];
+
+#[test]
+fn console_threads_of_multidimensional_groups_are_one_each() {
+    let mut ran = Vec::new();
+    for (wave64, host_wave) in [(false, 32), (true, 64), (true, 32)] {
+        let w: u32 = if wave64 { 64 } else { 32 };
+        let mut shapes = SHAPES_32.to_vec();
+        shapes.push([w, 2, 1]);
+        for threads in shapes {
+            let what = format!("console wave{w}, host waves of {host_wave}, {threads:?}");
+            let shader = flat_id_adds_lowered(threads, wave64, host_wave, None)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            if let Some((out, want)) = flat_id_adds_on_the_card(&shader, threads, wave64) {
+                assert_eq!(out, want, "{what}");
+                ran.push(what);
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: {ran:#?}");
+}
+
+/// `VICTORY_THREAD_TICKETS=0` (here: the test's own choice) is the translation this tree had:
+/// the console-wave32 programs of groups of 2-D or 3-D shapes and more than one wave differ from
+/// the ones with the counter, those of 1-D groups and of one host wave do not.
+#[test]
+fn the_ticket_switch_changes_only_multidimensional_groups_of_several_waves() {
+    let make = |threads, tickets| {
+        flat_id_adds_lowered(threads, false, 32, Some(tickets))
+            .expect("lowered")
+            .dxil
+    };
+    for threads in SHAPES_32 {
+        assert_ne!(make(threads, true), make(threads, false), "{threads:?}");
+    }
+    for threads in [[64, 1, 1], [32, 1, 1], [4, 4, 2], [8, 4, 1]] {
+        assert_eq!(make(threads, true), make(threads, false), "{threads:?}");
+    }
+}
+
+/// What the old rounding gives on this card, one line per shape (no assertion: which shapes
+/// collide depends on the card and the driver; the run on an RTX 5080 is in docs/findings.md).
+/// Run with `-- --nocapture`.
+#[test]
+fn the_old_rounding_of_console_threads_on_this_card() {
+    let mut bad = Vec::new();
+    for threads in SHAPES_32 {
+        let shader = flat_id_adds_lowered(threads, false, 32, Some(false)).expect("lowered");
+        for run in 0..4 {
+            let Some((out, want)) = flat_id_adds_on_the_card(&shader, threads, false) else {
+                return;
+            };
+            let wrong = out.iter().zip(&want).filter(|(a, b)| a != b).count();
+            if wrong > 0 {
+                bad.push(format!("{threads:?} run {run}: {wrong} of {} dwords wrong", want.len()));
+                break;
+            }
+        }
+    }
+    eprintln!("rounding: {} of {} shapes wrong on the card: {bad:#?}", bad.len(), SHAPES_32.len());
+}
+
+/// A saved mask updated inside a divergent branch and read, both words, after the join (Belobug
+/// PR #345): `s[2:3] = lanes below 5; if (t >= s1) { s[2:3] |= lanes below 55 }`, then both
+/// dwords are stored per lane. With no lane left for the branch the OR changes nothing (the
+/// comparison clears both dwords of VCC), so the skip may go (`ir::without_skips`, deep) and
+/// the program translates in an exact form; without it the program is refused ("a lane mask
+/// holding lanes elsewhere read as data"). `VICTORY_EMPTY_MASK_OR=0`, here the test's choice
+/// of `ir::TEST_EMPTY_MASK_OR`, is the refusal.
+fn branch_mask_program() -> NativeProgram {
+    native(&[
+        0x7D88_0085, // v_cmp_gt_u32 vcc, 5, v0: bits 0..4
+        0xBE82_046A, // s_mov_b64 s[2:3], vcc
+        0x7D86_0001, // v_cmp_le_u32 vcc, s1, v0: lanes at or above the threshold
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0002, // s_cbranch_execz -> join
+        0x7D88_00B7, // v_cmp_gt_u32 vcc, 55, v0: add active lanes below 55
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x88FE_047E, // join: s_or_b64 exec, exec, s[4:5]
+        0x7E08_0202, // v_mov_b32 v4, s2
+        0x7E0A_0203, // v_mov_b32 v5, s3
+        0x3412_0083, // v_lshlrev_b32 v9, 3, v0
+        0xE070_1000,
+        0x8002_0409, // buffer_store_dword v4, v9, s[8:11], 0 offen
+        0xE070_1004,
+        0x8002_0509, // buffer_store_dword v5, v9, s[8:11], 0 offen offset:4
+    ])
+}
+
+/// [`branch_mask_program`] through the whole of `emit` (its retries included) for a host of
+/// 32-lane waves, with `empty_mask_or` as the test's choice for `VICTORY_EMPTY_MASK_OR`.
+fn branch_mask_emitted(empty_mask_or: bool) -> Result<HostShader, ShaderError> {
+    let native = branch_mask_program();
+    let p = crate::spill::build(&native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("IO");
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let before = ir::TEST_EMPTY_MASK_OR.replace(Some(empty_mask_or));
+    let result = super::emit(&container, &native, &p, &st, &io, &res);
+    ir::TEST_EMPTY_MASK_OR.set(before);
+    lower::TEST_HOST_WAVE.set(was);
+    result
+}
+
+#[test]
+fn a_branch_mask_is_refused_without_the_empty_mask_or_and_translates_with_it() {
+    let Err(refused) = branch_mask_emitted(false) else {
+        panic!("translated without the empty mask OR");
+    };
+    assert!(refused.to_string().contains("holding lanes elsewhere"), "{refused}");
+    let shader = branch_mask_emitted(true).expect("translation with the empty mask OR");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
+
+#[test]
+fn a_branch_mask_keeps_both_words_on_the_card() {
+    let shader = branch_mask_emitted(true).expect("translation");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (threshold, expected) in [
+        (0, [u32::MAX, 0x007f_ffff]),     // all lanes enter
+        (32, [0x0000_001f, 0x007f_ffff]), // only the upper half enters
+        (48, [0x0000_001f, 0x007f_0000]), // only the top 16 enter
+        (64, [0x0000_001f, 0]),           // no lane enters; the old mask survives
+    ] {
+        let Some(out) = whole_uav(&shader, [0, threshold], 128) else {
+            return;
+        };
+        for (lane, pair) in out.chunks_exact(2).enumerate() {
+            assert_eq!(pair, expected, "threshold {threshold}, lane {lane}");
+        }
+    }
+    eprintln!("ran on the hardware device: four thresholds, both words right in all 64 lanes");
+}
+
+// Divergent loops whose scalar is read per lane after them (Belobug/VIctory-Belobug-AMD PR #366,
+// issues #299 and #352). One console wave64 of 64 threads on a host of 32-lane waves, two host
+// waves: on the console the loop runs until the last lane is out and a scalar it counts holds the
+// wave's count in every lane afterwards; with per-lane control flow each lane read the count of
+// its own iterations. `VICTORY_LOOP_SCALARS=0` (here `lower::TEST_LOOP_SCALARS`) is the old form.
+
+/// `body` then a store of v0 at v10 * 4 (v10 keeps the thread id) to dword v10 of the raw UAV.
+fn scalar_loop_program(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+    let mut words = body.to_vec();
+    words.extend_from_slice(&[
+        0x3412_1482,                       // v_lshlrev_b32 v9, 2, v10
+        0x38 << 26 | 0x1C << 18 | 1 << 12, // buffer_store_dword v0, v9, s[8:11], 0 offen
+        0x80 << 24 | 2 << 16 | 9,
+    ]);
+    native_of(&words, wave64, threads)
+}
+
+/// The program through the whole of `emit` (its retries included) for a host of 32-lane waves.
+fn scalar_loop_emitted(
+    native: &NativeProgram,
+    loop_scalars: Option<bool>,
+) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, native).expect("IO");
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let before = lower::TEST_LOOP_SCALARS.replace(loop_scalars);
+    let result = super::emit(&container, native, &p, &st, &io, &res);
+    lower::TEST_LOOP_SCALARS.set(before);
+    lower::TEST_HOST_WAVE.set(was);
+    result
+}
+
+/// The loop latches `lower::scalar_loop_latches` selects in `native`.
+fn scalar_loop_latches_of(native: &NativeProgram) -> HashSet<usize> {
+    let p = crate::spill::build(native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    lower::scalar_loop_latches(&p, &st)
+}
+
+/// What the program stores for each of its `threads` threads, on the card (None without one
+/// that takes it), as translated with `loop_scalars` (None: the process's choice).
+fn scalar_loop_on_the_card(
+    native: &NativeProgram,
+    loop_scalars: Option<bool>,
+    threads: u32,
+) -> Option<Vec<u32>> {
+    let shader = scalar_loop_emitted(native, loop_scalars).expect("translation");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    whole_uav(&shader, [0, 0], threads)
+}
+
+/// A program the synchronized latches change: translated with them, every lane stores
+/// `expected`; translated as before (`VICTORY_LOOP_SCALARS=0`) it does not (each lane stores
+/// the count of its own iterations).
+fn scalar_loop_is_fixed(body: &[u32], expected: &[u32]) {
+    let n = expected.len() as u32;
+    let native = scalar_loop_program(body, true, n);
+    assert!(!scalar_loop_latches_of(&native).is_empty(), "no latch selected");
+    let on = scalar_loop_emitted(&native, Some(true)).expect("translation");
+    let off = scalar_loop_emitted(&native, Some(false)).expect("translation");
+    assert_ne!(on.dxil, off.dxil, "the switch changes nothing");
+    if let Some(got) = scalar_loop_on_the_card(&native, Some(true), n) {
+        assert_eq!(got, expected, "with the synchronized latches");
+        let Some(old) = scalar_loop_on_the_card(&native, Some(false), n) else {
+            return;
+        };
+        assert_ne!(old, expected, "the old form is right here: nothing to fix on this card");
+        eprintln!("old form: {old:?}\nnew form: {got:?}");
+    }
+}
+
+/// A program the synchronized latches leave alone: the same translation either way.
+fn scalar_loop_is_untouched(native: &NativeProgram, expected: Option<&[u32]>) {
+    let on = scalar_loop_emitted(native, Some(true)).expect("translation");
+    let off = scalar_loop_emitted(native, Some(false)).expect("translation");
+    assert_eq!(on.dxil, off.dxil, "the switch changes the translation");
+    if let Some(expected) = expected
+        && let Some(got) = scalar_loop_on_the_card(native, None, expected.len() as u32)
+    {
+        assert_eq!(got, expected);
+    }
+}
+
+#[test]
+fn a_divergent_scalar_loop_counts_for_the_whole_wave() {
+    // PR #299: each lane loops t + 1 times; s6 counts the iterations
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8106, // loop: s_add_i32 s6, s6, 1
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[64; 64],
+    );
+}
+
+/// The longest loop is in the second host wave, or in the first: the other one has to wait for it
+/// (trip counts 1 to 4 in one half, 6 to 9 in the other; s6 += 3 each iteration).
+#[test]
+fn both_host_waves_count_the_longest_loop_of_the_wave() {
+    for longer_first in [false, true] {
+        let mut body = vec![
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x3602_0083, // v_and_b32 v1, 3, v0
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x2C08_0085, // v_lshrrev_b32 v4, 5, v0: 0 in the first half, 1 in the second
+        ];
+        if longer_first {
+            body.push(0x3A08_0881); // v_xor_b32 v4, 1, v4
+        }
+        body.extend([
+            0x340A_0882, // v_lshlrev_b32 v5, 2, v4
+            0x4A02_0304, // v_add_nc_u32 v1, v4, v1
+            0x4A02_0305, // v_add_nc_u32 v1, v5, v1: 5 more in the longer half
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8306, // loop: s_add_i32 s6, s6, 3
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ]);
+        scalar_loop_is_fixed(&body, &[27; 64]);
+    }
+}
+
+#[test]
+fn nested_divergent_scalar_loops_count_for_the_whole_wave() {
+    // PR #299: the inner loop runs (t >> 4) + 1 times, the outer (t & 3) + 1 times
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x3602_0083, // v_and_b32 v1, 3, v0
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x2C08_0084, // v_lshrrev_b32 v4, 4, v0
+            0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0xBE8C_0480, // s_mov_b64 s[12:13], 0
+            0x7E06_0304, // v_mov_b32 v3, v4
+            0x8106_8106, // s_add_i32 s6, s6, 1
+            0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+            0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+            0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+            0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+            0xBF89_FFFA, // s_cbranch_execnz inner
+            0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFF2, // s_cbranch_execnz outer
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[16; 64],
+    );
+}
+
+/// Two loops one after the other: the first loop's s6 goes on into the second (through a phi),
+/// and the second leaves two scalars.
+#[test]
+fn consecutive_divergent_loops_carry_their_scalars() {
+    scalar_loop_is_fixed(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE87_038B, // s_mov_b32 s7, 11
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x8106_8106, // first loop: s6 += 1
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFA, // s_cbranch_execnz first loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x3602_1483, // v_and_b32 v1, 3, v10
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x8106_8306, // second loop: s6 += 3, starting at the first loop's result
+            0x8107_8207, // s7 += 2
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFF9, // s_cbranch_execnz second loop
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x8106_0706, // s_add_i32 s6, s6, s7
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        &[64 + 3 * 4 + 11 + 2 * 4; 64],
+    );
+}
+
+/// What the synchronized latches leave alone: a loop every lane leaves together (a uniform
+/// exit), a loop whose only results are per lane, a loop of a console wave32.
+#[test]
+fn loops_without_a_per_lane_scalar_are_translated_as_before() {
+    // s6 counts to 4 in every lane
+    let uniform = scalar_loop_program(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8106, // loop: s_add_i32 s6, s6, 1
+            0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        true,
+        64,
+    );
+    assert!(scalar_loop_latches_of(&uniform).is_empty());
+    scalar_loop_is_untouched(&uniform, Some(&[4; 64]));
+    // each lane counts its own iterations in a vector register, nothing scalar leaves the loop
+    let vector_only = scalar_loop_program(&scalar_loop_vector_body(false), true, 64);
+    assert!(scalar_loop_latches_of(&vector_only).is_empty());
+    let want: Vec<u32> = (1..=64).collect();
+    scalar_loop_is_untouched(&vector_only, Some(&want));
+    // a console wave32 (the scalar is the wave's own: one host wave)
+    let wave32 = scalar_loop_program(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x7E16_0280, // v_mov_b32 v11, 0
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0x4A16_1681, // loop: v_add_nc_u32 v11, 1, v11
+            0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0x7E00_030B, // v_mov_b32 v0, v11
+        ],
+        false,
+        32,
+    );
+    assert!(scalar_loop_latches_of(&wave32).is_empty());
+    scalar_loop_is_untouched(&wave32, Some(&(1..=32).collect::<Vec<u32>>()));
+}
+
+/// A scalar shared by the lanes and a lane-local vector count: the scalar is the wave's, the
+/// vector each lane's own (v0 = v11 + s6).
+fn scalar_loop_vector_body(shared: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+    ];
+    if shared {
+        body.extend([0xBE86_0387, 0x8106_8306]); // s6 = 7; loop: s6 += 3
+    }
+    body.extend([
+        0x4A16_1681, // v_add_nc_u32 v11, 1, v11
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        if shared { 0xBF89_FFF9 } else { 0xBF89_FFFA },
+        0x88FE_027E,                                    // s_or_b64 exec, exec, s[2:3]
+        if shared { 0x4A00_1606 } else { 0x7E00_030B }, // v0 = v11 + s6 or v11
+    ]);
+    body
+}
+
+#[test]
+fn a_shared_scalar_and_a_lane_local_vector_count_each_their_own() {
+    let want: Vec<u32> = (1..=64).map(|t| 7 + 3 * 64 + t).collect();
+    scalar_loop_is_fixed(&scalar_loop_vector_body(true), &want);
+}
+
+/// The synchronized latches are for one console wave in the group (two host waves): a group of
+/// two console waves is translated as before, whatever the loops hold.
+#[test]
+fn groups_of_several_console_waves_keep_their_translation() {
+    let native = scalar_loop_program(&scalar_loop_vector_body(true), true, 128);
+    assert_eq!(scalar_loop_latches_of(&native).len(), 1);
+    scalar_loop_is_untouched(&native, None);
+}
+
+/// A skip around the loop (some lanes never enter it) is a shape the synchronized latches do not
+/// take.
+#[test]
+fn a_loop_behind_a_skip_is_translated_as_before() {
+    let body = scalar_loop_vector_body(true);
+    let mut words = vec![
+        0x7D88_00A0,                           // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8C_246A,                           // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | (body.len() + 3) as u32, // s_cbranch_execz past body and store to s_endpgm
+    ];
+    words.extend(body);
+    let native = scalar_loop_program(&words, true, 64);
+    assert!(scalar_loop_latches_of(&native).is_empty());
+    scalar_loop_is_untouched(&native, None);
+}
+
+/// A lane mask read as a number inside a lane branch, with both host waves of a console wave64
+/// exchanging (kelvaroq patches 0033 and 0047, `VICTORY_WAVE_ZERO_MASK`; the test's choice here
+/// is `lower::TEST_ZERO_MASK`). Threads below s0 read both dwords of a scalar mask s[14:15] and
+/// store 1 + (lo ^ hi). An empty mask (`s_xor_b64 s[14:15], exec, exec`) is zero in both dwords
+/// whatever the other half of the console wave does; a copy of EXEC made in the entry block
+/// (`s_or_b64 s[14:15], exec, exec`) is read where it was made, by both waves; a mask only some
+/// lanes hold (`s_and_b64 s[14:15], exec, 1`) still needs every lane there.
+#[test]
+fn empty_and_copied_wave_masks_can_be_read_in_a_lane_branch() {
+    let lower_mask = |op, on| {
+        let native = native(&[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0007, // s_cbranch_execz to the restore of EXEC
+            op,
+            0x7E0A_020E, // v_mov_b32 v5, s14
+            0x7E0C_020F, // v_mov_b32 v6, s15
+            0x3A0A_0D05, // v_xor_b32 v5, v5, v6
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 5 << 8, // buffer_store_dword v5, off, s[8:11], 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ]);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let previous = lower::TEST_ZERO_MASK.replace(Some(on));
+        let result = lowered(&native, &p, &HashSet::new());
+        lower::TEST_ZERO_MASK.set(previous);
+        result
+    };
+    const XOR_EXEC: u32 = 0x898E_7E7E; // s_xor_b64 s[14:15], exec, exec
+    const OR_EXEC: u32 = 0x888E_7E7E; // s_or_b64 s[14:15], exec, exec
+    const AND_ONE: u32 = 0x878E_817E; // s_and_b64 s[14:15], exec, 1
+    const EXCHANGED: &str = "a lane mask exchanged where not every lane runs";
+    // (as before: all three are refused, with the switch off)
+    assert!(
+        matches!(lower_mask(XOR_EXEC, false), Err(ShaderError::Unsupported { what, .. }) if what == EXCHANGED),
+        "the empty mask with the switch off"
+    );
+    assert!(lower_mask(OR_EXEC, false).is_err(), "the copy of EXEC with the switch off");
+    let dynamic = lower_mask(AND_ONE, true);
+    assert!(
+        matches!(&dynamic, Err(ShaderError::Unsupported { what, .. }) if *what == EXCHANGED),
+        "{:?}",
+        dynamic.err()
+    );
+    let empty = lower_mask(XOR_EXEC, true).expect("empty mask");
+    let copied = lower_mask(OR_EXEC, true).expect("copy of EXEC");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (shader, copied_mask) in [(&empty, false), (&copied, true)] {
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
+        for below in [1, 32, 40, 64] {
+            let bits = if copied_mask { u64::MAX >> (64 - below) } else { 0 };
+            let expected = ((bits as u32) ^ (bits >> 32) as u32).wrapping_add(1);
+            if let Some(actual) = on_the_card(shader, [below, 0]) {
+                assert_eq!(actual, expected, "{below} active lanes, copied mask {copied_mask}");
+            }
+        }
+    }
+}
+
+#[path = "paired_tests.rs"]
+mod paired;

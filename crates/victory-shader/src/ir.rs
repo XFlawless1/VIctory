@@ -786,6 +786,66 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
     }
 }
 
+/// `VICTORY_EMPTY_MASK_OR=0`: `without_skips` does not take a skip whose region only ORs a
+/// comparison into a saved mask (the form that left "a lane mask holding lanes elsewhere read as
+/// data" standing). Part of the translation: the shader cache keys on it.
+fn empty_mask_or() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EMPTY_MASK_OR.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_MASK_OR").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`empty_mask_or`], for its thread only.
+    pub(crate) static TEST_EMPTY_MASK_OR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The two dwords of `dst = old | VCC` when VCC comes directly from a comparison under empty
+/// EXEC: both VCC dwords are zero then, so the OR leaves both dwords of `old` as they were.
+/// Returns, for each dword, (the value the OR writes, the value of `old` it reads). SCC and
+/// VCC themselves may change and are still checked at the join.
+/// (Ported from Belobug/VIctory-Belobug-AMD PR #345.)
+fn mask_or_on_empty(block: &Block) -> Option<[(Value, Value); 2]> {
+    let [cmp, or] = block.insts.as_slice() else {
+        return None;
+    };
+    if cmp.machine.encoding != gfx10::Encoding::Vopc
+        || !cmp.name().starts_with("v_cmp_")
+        || or.name() != "s_or_b64"
+    {
+        return None;
+    }
+    let Fields::Sop {
+        dst: Some(Operand::Scalar { code: dst, .. }),
+        src,
+        ..
+    } = &or.fields
+    else {
+        return None;
+    };
+    let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src.as_slice() else {
+        return None;
+    };
+    // Both dwords must be ordinary SGPRs, including for an unaligned encoding.
+    if *dst >= VCC - 1 {
+        return None;
+    }
+    let old = match (*a, *b) {
+        (VCC, other) | (other, VCC) if other < VCC - 1 => other,
+        _ => return None,
+    };
+    let word = |i| {
+        let mask = Reg::S(VCC + i);
+        (cmp.write(mask)? == or.read(mask)?)
+            .then_some((or.write(Reg::S(*dst + i))?, or.read(Reg::S(old + i))?))
+    };
+    Some([word(0)?, word(1)?])
+}
+
 /// As [`without_early_outs`], and also without the branches that only skip a
 /// region when no lane is left for it: an `s_cbranch_execz` whose target is
 /// where the skipped code ends up anyway (`if (c) { ... }` with nothing
@@ -886,6 +946,13 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
+        // (a region of one comparison and an OR of it into a saved mask changes nothing under
+        // empty EXEC: both dwords of VCC are zero)
+        let empty = if deep && empty_mask_or() && p.blocks[first].exit == Exit::Jump(target) {
+            mask_or_on_empty(&p.blocks[first])
+        } else {
+            None
+        };
         for phi in &join.phis {
             let scalar = match phi.reg {
                 Reg::S(c) => c != 126 && c != 127,
@@ -899,7 +966,12 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             let before: Vec<Value> =
                 join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
             let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
-            if within.into_iter().any(|a| !before.contains(&a)) {
+            if within.into_iter().any(|a| {
+                !before.contains(&a)
+                    && !empty.as_ref().is_some_and(|words| {
+                        words.iter().any(|&(out, old)| out == a && before.contains(&root(old)))
+                    })
+            }) {
                 return None;
             }
         }
@@ -1837,6 +1909,38 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    /// A region of a comparison and its OR into a saved mask (`s_or_b64 s[6:7], vcc, s[6:7]`)
+    /// changes nothing when no lane is left for it: both dwords of VCC are zero then (Belobug
+    /// PR #345). SCC and VCC are what the comparison and the OR do change, so a join that reads
+    /// them keeps the skip, and so does an OR that does not keep its destination.
+    #[test]
+    fn removing_an_empty_mask_or_preserves_each_observed_scalar() {
+        const CMP: u32 = 0x7D88_00B7; // v_cmp_gt_u32 vcc, 55, v0
+        const OR: u32 = 0x8886_066A; // s_or_b64 s[6:7], vcc, s[6:7]
+        const USE_S6: u32 = 0x7E02_0206; // v_mov_b32 v1, s6
+        let identity = skip(&[CMP, OR], &[USE_S6]);
+        assert_eq!(skips(&identity), 1);
+        assert_eq!(skips(&without_skips(&identity, true).expect("unchanged when empty")), 0);
+        // (the shallow form follows no scalars: the skip stays)
+        assert!(without_skips(&identity, false).is_none());
+        // `VICTORY_EMPTY_MASK_OR=0`: as before the port, the skip stays
+        TEST_EMPTY_MASK_OR.set(Some(false));
+        let off = without_skips(&identity, true);
+        TEST_EMPTY_MASK_OR.set(None);
+        assert!(off.is_none());
+
+        for used in [0x7E04_026A, 0x7E04_02FD] {
+            // v_mov_b32 v2, vcc_lo / scc
+            assert!(without_skips(&skip(&[CMP, OR], &[USE_S6, used]), true).is_none());
+        }
+        // The OR would copy s[8:9] to s[6:7] even with an empty mask.
+        assert!(without_skips(&skip(&[CMP, 0x8886_086A], &[USE_S6]), true).is_none());
+        // Pair starting at s105 overlaps VCC_LO as its second dword.
+        for or in [0x88E9_686A, 0x8886_696A] {
+            assert!(mask_or_on_empty(&skip(&[CMP, or], &[USE_S6]).blocks[1]).is_none());
+        }
     }
 
     #[test]

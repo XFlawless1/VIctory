@@ -363,6 +363,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// The same counter for console lanes in a 2-D or 3-D group of more than one host wave
+    /// ([`thread_tickets`]).
+    tickets: Option<u32>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -522,6 +525,155 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
         }
     }
     Some(out)
+}
+
+/// `VICTORY_LOOP_SCALARS=0`: a console wave64 compute program of one console wave on a host of
+/// 32-lane waves whose divergent loops leave a scalar that is read per lane after them is no
+/// longer given the form with synchronized loop latches ([`scalar_loop_latches`]): each host
+/// wave then counts the scalar on its own, and every lane reads the count of its own iterations.
+/// Ported from Belobug/VIctory-Belobug-AMD PR #366. Part of the translation: the shader cache
+/// keys on it.
+pub(super) fn loop_scalars() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOOP_SCALARS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_SCALARS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`loop_scalars`], for its thread only.
+    pub(super) static TEST_LOOP_SCALARS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Loop latches that must run in step to preserve an SGPR read after a divergent
+/// exit. Only consider a forward path with properly nested EXEC back edges.
+/// Every loop then has a single entry and exit, and a nest that meets at a
+/// latch cannot be entered or re-entered by only part of the group.
+/// (Ported from Belobug/VIctory-Belobug-AMD PR #366.)
+pub(super) fn scalar_loop_latches(p: &crate::ir::Program, st: &Structured) -> HashSet<usize> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut positions = vec![usize::MAX; p.blocks.len()];
+    for (index, &block) in order.iter().enumerate() {
+        positions[block] = index;
+    }
+    let mut loops = Vec::new();
+    for (index, &block) in order.iter().enumerate() {
+        let next = order.get(index + 1).copied();
+        match st.exits[block] {
+            LaneExit::Jump(to) if next == Some(to) => {}
+            LaneExit::End if next.is_none() => {}
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } if Some(not_taken) == next
+                && positions[taken] <= index
+                && p.blocks[block]
+                    .insts
+                    .last()
+                    .is_some_and(|i| i.name() == "s_cbranch_execnz") =>
+            {
+                loops.push((positions[taken], index));
+            }
+            _ => return HashSet::new(),
+        }
+    }
+    if loops.is_empty() {
+        return HashSet::new();
+    }
+
+    // Keep this form to ordinary scalar and lane-local vector instructions,
+    // and loads/stores without LDS or a wave-dependent address calculation.
+    // In particular, a lane read could make an apparently scalar write vary.
+    let is_mask = |v| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let ordinary_sgpr = |reg, value| matches!(reg, Reg::S(0..=105)) && !is_mask(value);
+    let mut last_use = HashMap::new();
+    for (index, &b) in order.iter().enumerate() {
+        let block = &p.blocks[b];
+        for phi in &block.phis {
+            for &arg in &phi.args {
+                last_use.insert(arg, index);
+            }
+        }
+        for inst in &block.insts {
+            let name = inst.name();
+            let local = match &inst.fields {
+                Fields::Sop { src, .. } => {
+                    !src.iter().any(|op| matches!(op, Operand::Const(251 | 252)))
+                }
+                Fields::Sopp { .. } => matches!(name, "s_branch" | "s_cbranch_execnz" | "s_endpgm"),
+                Fields::Smem { .. } => name.starts_with("s_load_"),
+                Fields::Buffer { lds: false, .. } => !name.contains("atomic"),
+                Fields::Valu(v) => {
+                    v.dpp.is_none()
+                        && !name.contains("lane")
+                        && !name.starts_with("v_mbcnt")
+                        && inst
+                            .writes
+                            .iter()
+                            .all(|&(reg, value)| !ordinary_sgpr(reg, value))
+                }
+                _ => false,
+            };
+            if !local || reads_mask_as_data(st, inst) {
+                return HashSet::new();
+            }
+            for &(_, read) in &inst.reads {
+                last_use.insert(read, index);
+            }
+        }
+    }
+
+    // Sort outer loops before their children, rejecting overlapping loops
+    // and multiple back edges to one header.
+    loops.sort_unstable();
+    let mut open = Vec::new();
+    for &(header, latch) in &loops {
+        while open.last().is_some_and(|&(_, end)| end < header) {
+            open.pop();
+        }
+        if open
+            .last()
+            .is_some_and(|&(start, end)| start == header || end <= latch)
+        {
+            return HashSet::new();
+        }
+        open.push((header, latch));
+    }
+    let mut wide = HashSet::new();
+    let mut remaining = loops.as_slice();
+    while let Some(&(_, last)) = remaining.first() {
+        let count = remaining.partition_point(|&(header, _)| header <= last);
+        let (nest, rest) = remaining.split_at(count);
+        let scalar_escapes = nest.iter().any(|&(header, latch)| {
+            let LaneExit::Branch { when, .. } = st.exits[order[latch]] else {
+                return false;
+            };
+            st.bools
+                .support(when)
+                .iter()
+                .any(|a| !matches!(a, Atom::Uniform(_)))
+                && order[header..=latch].iter().any(|&b| {
+                    p.blocks[b]
+                        .insts
+                        .iter()
+                        .flat_map(|i| &i.writes)
+                        .any(|&(reg, value)| {
+                            ordinary_sgpr(reg, value)
+                                && last_use.get(&value).is_some_and(|&at| at > latch)
+                        })
+                })
+        });
+        if scalar_escapes {
+            // A lane leaving an outer iteration must still reach the inner
+            // vote in the next iteration. Conversely, the inner vote must
+            // finish before the wave can make its outer loop decision.
+            wide.extend(nest.iter().map(|&(_, latch)| order[latch]));
+        }
+        remaining = rest;
+    }
+    wide
 }
 
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
@@ -744,6 +896,27 @@ fn strict_uniform() -> bool {
 thread_local! {
     /// A test's choice for [`strict_uniform`], for its thread only.
     pub(super) static TEST_STRICT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_THREAD_TICKETS=0`: a console-lane program in a 2-D or 3-D group of more than one host
+/// wave takes its console threads from the host wave's first flat id rounded down to the wave
+/// size, as this tree did before (and `wave_base`, the counter of a console wave64 program in
+/// host waves of 32, gives every host wave a block of 32 whatever its lanes, a partial wave too).
+/// Ported from Belobug/VIctory-Belobug-AMD PR #442. Part of the translation: the shader cache
+/// keys on it.
+fn thread_tickets() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TICKETS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_TICKETS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`thread_tickets`], for its thread only.
+    pub(super) static TEST_TICKETS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`lane_uniform`] as this tree had it before 431cab5d and the fixes after it of the Belobug
@@ -1269,6 +1442,25 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_paired`].
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a lowering) with each host lane carrying two guest lanes ([`bitcode::paired`]):
+/// a console wave64 compute program on a host of 32-lane waves keeps both halves of its wave in
+/// one host wave, so that lane reads, masks and wave reductions need no second host wave and no
+/// group barrier. (Ported from kelvaroq patch 0052, `VICTORY_WAVE64_PAIRED=1`.)
+///
+/// [`bitcode::paired`]: super::bitcode::paired
+pub(super) fn with_paired<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PAIRED.set(self.0);
+        }
+    }
+    let _reset = Reset(PAIRED.replace(true));
+    f()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1334,6 +1526,26 @@ thread_local! {
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_WAVE_ZERO_MASK=0`: a lane mask that is identically empty is read through the
+/// ballot of its lanes as before, and a mask that a lane branch copies from one written in the
+/// entry block is ballotted where it was made, not where it was copied
+/// ([`Lower::mask_dword`]). Ported from stellarr-studio/kelvaroq patches 0033 and 0047
+/// (GPL-3.0-or-later). Part of the translation: the shader cache keys on it.
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`zero_mask_on`], for its thread only.
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
@@ -1622,6 +1834,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a 2-D or 3-D group of more than one host wave: the same counter
+        let mut tickets: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1651,7 +1865,14 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            // (paired: both halves of the console wave are one host wave's, so its lane code is
+            // the console's, and no wave of 32 is made of it here)
+            console_lanes |= PAIRED.get();
+            if wave == 64
+                && host_max_wave() == 32
+                && !PAIRED.get()
+                && (console_lanes || one_wave && s.lds_dwords > 0)
+            {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1749,6 +1970,22 @@ impl<'a> Lower<'a> {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+            } else if thread_tickets()
+                && !PAIRED.get()
+                && console_lanes
+                && group > wave
+                && cs.threads[1..].iter().any(|&d| d > 1)
+                && s.lds_dwords < 8192
+            {
+                // A GPU need not give a host wave an aligned run of flat ids in a 2-D or 3-D
+                // group (NVIDIA's 8 x 8 groups, 2 x 2 quads on AMD, Belobug #216): the waves take
+                // their console threads from the same counter (one more dword, within D3D12's
+                // 32 KiB)
+                tickets = Some(s.lds_dwords);
+                s.lds_dwords += 1;
+                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    eprintln!("THREAD-TICKETS group={:?} wave={wave}", cs.threads);
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1929,6 +2166,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            tickets,
             wave_base: None,
             flat: None,
             no_barrier,
@@ -2547,6 +2785,8 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
+        let paired = PAIRED.get();
+        let mut lane_regions = Vec::new();
         let p = self.x.p;
         if counted {
             // Before anything else, so that wave counts, reads of the first
@@ -2635,7 +2875,18 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                let before = self.cur;
+                if paired && matches!(p.blocks[b].insts[i].fields, Fields::Ds { .. }) {
+                    // A single physical wave issues both halves of an LDS access. Finish the
+                    // preceding access before a lane can read a word that its partner wrote.
+                    let fence = self.s.m.i32(8);
+                    self.s.op(before, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[fence]);
+                }
                 self.inst(b, i)?;
+                if paired && before != self.cur {
+                    // (an instruction with control flow of its own: each half goes its own way)
+                    lane_regions.push((before, self.cur));
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2659,6 +2910,10 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if paired {
+            super::bitcode::paired::run(&mut self.s, &lane_regions, &self.tail)
+                .map_err(|why| unsupported(0, why))?;
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -3713,14 +3968,57 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar copy preserves both dwords even when some lanes skip the copy. If its source was
+    /// written in the entry block, both host waves can ballot it there before the branch.
+    /// (Ported from kelvaroq patch 0047.)
+    fn entry_mask_copied_by(&self, block: usize, lo: Value) -> Option<Value> {
+        let inst = self.x.p.blocks[block]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let operand = match (inst.name(), src.as_slice()) {
+            ("s_mov_b64", [a]) => a,
+            ("s_and_b64" | "s_or_b64", [a, b]) if a == b => a,
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *operand else {
+            return None;
+        };
+        let source = inst.read(Reg::S(code))?;
+        let high = inst.read(Reg::S(code.checked_add(1)?))?;
+        (self.x.p.blocks[0].preds.is_empty()
+            && self.def_block.get(&source) == Some(&0)
+            && self.x.st.highs.get(&high) == Some(&source)
+            && self.x.st.active.contains(&source))
+        .then_some(source)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
-        let (lo, high) = match self.x.st.highs.get(&v) {
+        let (mut lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        if zero_mask_on()
+            && !self.local
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && let Some(&block) = self.def_block.get(&lo)
+            && !self.all_lanes(block)
+            && let Some(source) = self.entry_mask_copied_by(block, lo)
+        {
+            lo = source;
+        }
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask (one every lane of the console
+        // wave writes as zero: `active`): either dword is zero even when the other half of a
+        // console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() && self.x.st.active.contains(&lo) {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
@@ -4303,13 +4601,16 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A console wave64 program in host waves of 32: the first console thread of this host wave
-    /// (0, 32, 64, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's
-    /// 8 x 8 groups), so each wave takes the next 32 from an LDS counter instead: every thread
-    /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
-    /// found. Branch-free, in the entry block, which every thread runs.
+    /// A console wave64 program in host waves of 32, or console lanes in a 2-D or 3-D group of
+    /// more than one host wave (`tickets`): the first console thread of this host wave (0, wave,
+    /// 2 wave, ...). A GPU need not give a host wave consecutive thread indices (NVIDIA's 8 x 8
+    /// groups, 2 x 2 quads on AMD), so each wave takes the next block from an LDS counter
+    /// instead: every thread zeroes it, the group meets, each full wave's first lane adds the
+    /// wave size and the wave takes what it found. A partial wave (a group that is not whole
+    /// waves) takes the last block, which the console's last wave holds. Branch-free, in the
+    /// entry block, which every thread runs. (Ported from Belobug/VIctory-Belobug-AMD PR #442.)
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.tickets)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4322,18 +4623,42 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        let wave = self.s.wave_size.expect("set with console lanes");
+        let size = self.s.m.i32(wave);
+        // (a group of one host wave has nothing to order: its wave takes block 0 either way)
+        let threads = self.s.threads.expect("compute").iter().product::<u32>();
+        let tail = if thread_tickets() && threads > wave { threads % wave } else { 0 };
+        if tail != 0 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("THREAD-TICKETS partial wave: group of {threads} threads, waves of {wave}");
+        }
+        // (a full wave counts `wave` lanes running)
+        let full = (tail != 0).then(|| {
+            let yes = self.s.m.bool(true);
+            let count = self.s.op(e, "waveAllOp", Attr::NoUnwind, i32t, 135, &[yes]);
+            self.s.m.cmp(e, pred::EQ, count, size)
+        });
+        let takes = match full {
+            Some(full) => self.s.m.bin(e, Bin::And, first, full),
+            None => first,
+        };
+        let add = self.s.m.select(e, takes, size, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = match full {
+            Some(full) => {
+                let last = self.s.m.i32(threads - tail);
+                self.s.m.select(e, full, base, last)
+            }
+            None => base,
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
     }
 
     /// The console thread index of this thread in the group: `wave_base` plus the host lane
-    /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
+    /// (`halves`, `tickets`), else the wave's first thread index rounded down plus the lane.
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
@@ -4759,7 +5084,8 @@ impl<'a> Lower<'a> {
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
+    /// wave-aligned run of flat ids, as the console's waves do; 2-D and 3-D
+    /// groups of more than one host wave take `wave_base` instead.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -4767,7 +5093,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.tickets.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));

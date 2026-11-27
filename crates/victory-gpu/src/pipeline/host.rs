@@ -400,6 +400,19 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// The lane bounds (smallest, largest) a translated shader declares in its pipeline validation
+/// data: valid DXIL can still need a wave wider than the device runs. (From kelvaroq patch 0047.)
+fn wave_lanes(dxil: &[u8]) -> Option<[u32; 2]> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    let size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    let info = psv.get(4..)?.get(..size)?;
+    Some([
+        u32::from_le_bytes(info.get(16..20)?.try_into().ok()?),
+        u32::from_le_bytes(info.get(20..24)?.try_into().ok()?),
+    ])
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -630,7 +643,14 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            if victory_shader::emit::paired_compute_enabled() {
+                // (the dispatch grid counts guest groups: a paired program runs the guest
+                // threads of a group on half as many host threads, and says so in its lane bounds)
+                let lanes = stages[0].0.translated().and_then(|t| wave_lanes(&t.host.dxil));
+                tracing::info!(?shaders, wave_lanes = ?lanes, "host compute pipeline");
+            } else {
+                tracing::info!(?shaders, "host pipeline");
+            }
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
