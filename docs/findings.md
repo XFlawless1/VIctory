@@ -263,3 +263,22 @@ b4ba4bbb, bf7833a9, 9576c45f (the ambient stand-in settling by the clock, "rooms
 seconds after walking in"): conflicts in `descriptor/host.rs` and `host.rs`. The host-copy refresh, heap-record, guard
 and renderer-port commits are another piece of work's; FidelityFX, RX 9070 XT, output and scale switches, the frame
 rate switch and the cache-core affinity are not wanted.
+
+## kelvaroq's patch series, ported and measured here (2026-11-27)
+
+`stellarr-studio/kelvaroq` publishes a patch series (`native/patches`, GPL-3.0-or-later) written against
+fxceless/victory-fork f85101b, not against this tree: the hunks mostly miss, so what is taken was ported by hand, and each
+commit names its patch. The patches are read, never run.
+
+**0009, the cut of a parallel scan (`shadow.rs`; a bug fix, so no switch).** `Shadow::differing` compares a range of a host
+copy with its snapshot on up to eight threads (one per 16 MiB, so from 32 MiB), each share starting at a cut backwards to a
+piece boundary of title memory, `at - (start + at) % PIECE`. For the first share `at` is the range's own start, and when
+that is below its offset into the piece (a copy whose title address is not a multiple of 64 KiB, a range at the copy's
+start) the subtraction goes below zero: a panic where overflow checks are on, and in the diag and release builds a wrapped
+cut that `.max(from)` leaves huge, from which nothing is scanned: the first share, 16 MiB or more, was never compared and
+what shaders wrote there was not copied back. The scan is now a function over plain memory (`differing_pieces`, cut by
+`scan_boundary`, saturating as kelvaroq's patch has it), and `scan_cut_tests` runs the cut on its own and the whole scan
+against a serial one, over unaligned title addresses and starts: with the old formula both panic, `attempt to subtract
+with overflow`; with the fix they pass. The other two cuts of this kind in the file (`find_pieces`, `copy_wide`) cannot go
+below their start. Not shown: that the title has such a range (an unaligned copy start with a range of 32 MiB or more from
+the copy's start); the world's big heap copy is 100-170 MB, and its start is not known to be unaligned.
