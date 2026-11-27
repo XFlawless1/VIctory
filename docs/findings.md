@@ -528,3 +528,94 @@ index buffer of a host copy directly, and for `place_copy` and indirect clamps (
 `tx_all1` has no device removal. Left off by default: nothing here shows the switch to help (error 538 could not be
 counted), and a wrong state in a barrier is a way to break a picture; what would justify turning it on is a run with
 `VICTORY_D3D12_DEBUG=1` on a PC with Graphics Tools that shows 538 gone and the picture unchanged.
+
+## Constant buffers of tables read from a base of their own (2026-11-27)
+
+`VICTORY_CB_BASE` (translation switch, **off by default**: `=1` on; unset or `=0` the translation is the one before, byte for
+byte) and `VICTORY_CB_SPLIT` (host side, on; `=0` makes every such table whole as before; toggled, so `VICTORY_AB=<s>,VICTORY_CB_SPLIT`
+runs both in one run), `VICTORY_CBSTAT=1` (diagnostics: counts and times the parts of `State::tables`). The shader cache keys on
+`VICTORY_CB_BASE=1` only when it is on, so the translations cached without it keep their key; `TRANSLATOR_VERSION` stays 4
+because nothing a default build translates changes (the census below), and goes to 5 in the commit that turns the switch on.
+
+**Measured first** (prison cell, world seconds of one 240 s run, `VICTORY_CBSTAT=1`, switch off; frame 45.0 ms with the probes on,
+the probes cost something): 38,460 list calls and 113 ms a frame in `with_state` over the five recording threads. `State::tables`
+is 76 ms of it in the 9,300 stage calls a frame that hold a table with a constant buffer (8.1 us a call): 8,200 tables made afresh
+a frame (6.6 us each, 7.9 entries each, of which 1.4 constant buffers, 3.9 other entries the stage reads, 2.6 it does not) and
+4,800 found again in the list (2.2 us); the title's own tables, with none, are 1 ms. Per entry (one table in eight timed) 0.71 us
+for an entry that is not a constant buffer, 0.61 for a constant buffer. So the entries that are not constant buffers of such
+tables took 38 ms of the 113 (34 %) and the part the base can take away, 3.9 + 2.6 of 7.9 entries a table less what the title's own
+tables cost, was estimated at 25-30 ms a frame over the threads: over the 2 ms asked for, so it was built. Two things found on
+the way: the title builds a table for each draw in its heap and **most of them (about three in four of those with a constant buffer) lie
+past the 1,000,000 views of the host's heap** (`host view heap capped at 1000000`, the title's holds 1,245,184), where the
+title's own slots have no host slot, so "the title's own table stays the title's" cannot hold for them; and only 19 % of the
+other entries of the tables that do lie in the heap had their slot made already (`mirror_current`): a draw that reads them as
+the title's own table makes most of them, 1.0 us a `mirror`.
+
+**What it does.** (Translator, `emit/lower.rs`, `emit/shader.rs`.) With the switch a load of a descriptor that a table's used list
+says is a constant buffer, at a static offset (`Lower::cb_delta`), adds to its heap address the host-computed user-data dword of
+kind `USER_CB_BASE` (0x107) less the table's own; every other load of the table is as before. The dword is placed right after the
+highest user-data dword the program reads (not after all the layout's, as other host words are: the root signature holds 64
+dwords). A table that some load of the program reads by a computed index, per lane, or in a waterfall loop is read as the title's
+whole (a second round of lowering with that table left out, `Stop::CbTaint`), as is one whose slot is 64 or more. (Host,
+`draw.rs`.) A table whose shader has the dword is not made afresh whole:
+- its constant buffer views are made in a **block** of dynamic slots (the first slot less the first constant buffer's index, in the
+  dword, wrapping, so the block holds only their span), keyed by what they hold and where they lie (and by the table's address
+  where the title's own slots of it have a host slot), so draws of a list that name the same constant buffer share one block and one
+  copy of its bytes at submission;
+- the other entries it reads: where the table lies in the host heap, the title's own ([`State::table_entry`], as for tables with no
+  constant buffer); past the host heap, a block made afresh of **only the entries the
+  shader reads** (from the first of them), keyed by their records and places only (no table address), so every table of the list
+  that holds the same entries shares it.
+With `VICTORY_CB_SPLIT=0` such a table is whole as before and the dword is the table's own place (the shader adds zero).
+
+**Exactness.**
+- Census of the translator (`victory translate shaders.rpf --list --validate --jobs 8`, `VICTORY_HOST_WAVE=32`, 25,689 programs; each
+  program's line is a hash of its DXIL and of what the host binds for it): a tree built from 62d1f226 itself and this build with
+  `VICTORY_CB_BASE=0` agree on **all 25,689 (0 differ)**; with `=1` **21,848 differ** (85 %: nearly every program reads a table's constant
+  buffer) and 25,570 validate in all three (the same ones; 319 fail in all three, the baseline's).
+- `emit::tests::table_constant_buffers_are_read_from_their_own_base` (a card test with read-backs: the program loads a table's
+  descriptor of the constant buffer, reads its last four dwords at a constant offset and its last dword at a computed one, and writes
+  them to a UAV; entry 0 and entry 2 of the table, 64 B, 240 B (not a multiple of 256), 16 KiB and 64 KiB, each on WARP and on the RTX
+  5080, with the switch off and on; with it on the title's own slot of the constant buffer holds other bytes and the block lies after
+  the table, the base below the block's first slot for entry 2): the same dwords every time, and the translations differ and have the
+  dword only with the switch. Its program words are those of Belobug's `table_constant_buffers_read_as_raw_bytes_through_their_twins`
+  (VIctory-Belobug-AMD 3920dc26, renderer port 5, GPL-3.0-or-later); nothing else of that port was taken. Not covered by a test of
+  its own: a root constant buffer, one picked from the heap and a constant buffer not on 256 bytes in title memory: none of the
+  three is read through a table's entry, so the switch leaves the translation of those loads as it was (the census shows a program
+  that has only those unchanged), and the bytes of a constant buffer are copied to 256-byte aligned memory by the code that was
+  there. `draw::block_tests` checks the arithmetic of the block's base. Tests: 410 in `victory-gpu` (one new), 317 in
+  `victory-shader` (one new), 151 in `victory-hle`: all pass; the counts before were not run on 62d1f226 itself (the merge run
+  before the texture fixes had 391 and 295).
+
+**Frame time and list-call time** (prison cell, world seconds, frame lines of 4,400-4,500 draws).
+- In one run, the switch on and the host side toggled every 4 s (`VICTORY_CB_BASE=1 VICTORY_AB=4,VICTORY_CB_SPLIT`, 420 s; 36 world
+  phases each way, the same translated shaders, the tables whole as before in the off phases): median of the phases' medians **36.85 ms
+  with the host side on, 38.95 ms off**; the difference of each neighbouring pair of phases, on minus off: median **-2.20 ms** (mean
+  -1.82, sd 1.72, 69 pairs, below zero in 63). That is the host side alone. What the base costs the shaders (an add and a subtract of
+  user-data dwords for each constant buffer load) is not in it.
+- Three single runs of 240 s with `VICTORY_CBSTAT=1` (the probes cost something, more with the switch off: one new table in eight has
+  its entries made through `mirror` as well): off 45.0 ms, 38,460 list calls and 113.2 ms in list calls a frame over the threads;
+  base with the host side limited to the tables in the heap (the title's own entries, no blocks shared past it) 46.0 ms, 112.6 ms (the
+  title's own table for the other entries is no cheaper than copying them: 285 ns an entry in 90,000 calls a frame, against 710 ns for
+  an entry copied; `tables()` 75.9 -> 72.4 ms); base as committed 37.5 ms, **90.1 ms** in list calls, `tables()` for the stages with a
+  table of constant buffers 75.9 -> 55.7 ms (8.1 -> 6.1 us a call), tables made afresh 8,207 -> 4,530 new and 4,814 -> 2,656 met again, the
+  submitting thread's "copies" 16.1 -> 12.6 ms (the constant buffers' bytes are copied once for every block, not once for every draw).
+  Single runs: the 7.5 ms between 45.0 and 37.5 is more than the in-run pairs show (2.2), and part of it is the probes.
+
+**Other forks' leads, read for this work.** fxceless/victory-fork #1414 (`VICTORY_TABLED_ALL=1`, 9a18dd08 and four commits after it,
+KyleS98): the title's own slots of a table a draw binds count as a table's whatever they hold, so the pass over records the title
+copies in as bytes leaves them to their draws. Ours has that on already: `HostHeap::slot_tabled` stamps every slot of a table a draw reads
+or has made afresh (not only textures' ones), and `copied_tabled` leaves the records copied into such slots to the draws for
+`COPIED_FRAMES` (8) frames; the new blocks stamp the title's slots as the tables made afresh did (all slots up to the last the stage
+reads, or the ones it reads for a table of more than 64), so nothing is lost there. Its later commits are about the 240-frame window of
+its own stamps (a slot that stops being read stays with its draws for 240 frames); ours is 8. Upstream #3379 (de-duplicated
+`HostList::keep`, a stack array for user data, one `shadow::find`) and #3405 (a list lends the host copy it read) are not about tables
+and were not taken; our `keep` is called once per heap or pipeline change, not per table entry. Vilocity's 7.9 -> 5.4 us a list call is the
+batching of retired objects, which `VICTORY_RETIRE_BATCH` has.
+
+**Left off by default.** The host side shows 2.2 ms (6 %) in one run of paired phases, and 113 -> 90 ms of list-call time, but: (1) the
+picture was not compared on one frame (below), (2) the pairs of whole runs (translation off against on, 240 s each) were not made
+because the machine lock was not free: only the in-run toggling of the host side was, so what the shaders' extra arithmetic costs
+and what a cold shader cache costs (the first run with the switch on translates every shader it meets: 6.5 s frames in the first
+world seconds of the first run) are not measured, (3) the base changes the translation of 85 % of the programs. Turning it on would
+be: `CB_BASE_DEFAULT` in `emit/shader.rs`, `TRANSLATOR_VERSION` 5.
