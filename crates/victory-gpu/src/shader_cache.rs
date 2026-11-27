@@ -124,6 +124,7 @@ fn build() -> [u8; 32] {
             "VICTORY_EMPTY_MASK_OR",
             "VICTORY_LOOP_SCALARS",
             "VICTORY_WAVE_ZERO_MASK",
+            "VICTORY_WAVE64_PAIRED",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",

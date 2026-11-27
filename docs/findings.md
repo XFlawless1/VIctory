@@ -309,3 +309,44 @@ translated in the same last form (the one without skips, scalars followed, waves
 same texts at the same places), so the change is inside that form, in how a mask read as a number is made where it is
 provably empty or copied. That the nine come out the same on the card was not checked program by program (nothing here runs them
 against a reference), and the pictures of two runs are not comparable pixel by pixel.
+
+**Two guest lanes in each host lane (kelvaroq 0052; `VICTORY_WAVE64_PAIRED=1` turns it on, off by default; with it off the
+output is the previous commit's, so no `TRANSLATOR_VERSION` change).** A last retry for a console wave64 compute program on a
+host of at most 32-lane waves that no other form of this tree gives 32 lanes (or whose form needs lanes of the other host
+wave): `bitcode/paired.rs` rewrites the finished module so that host lane 7 carries guest lanes 7 and 39 (every value twice),
+threads / 2, ballots, lane reads, any/all, prefix and reduction taken over both copies, the guest threads numbered by a counter
+at entry, an LDS fence before each LDS access, and every branch that closes an IR block taken by the whole guest wave
+(`emit_paired` makes them `structure_wide`); it needs complete guest waves (a group of a multiple of 64, and with several waves
+`VICTORY_GROUP_SYNC` not 0) and refuses anything else (`VICTORY_WAVE_WHY=1` prints why). Taken as it is (`paired.rs`,
+`paired_tests.rs`, the hooks), hand-merged into `run()` and `emit`; `thread_tickets` is off inside it. Tests: the patch's five on
+the card (an OR over the wave for 0, 1, 31, 32, 33, 63 and 64 live lanes; LDS shared between lanes and between two guest waves
+(64 and 128 threads) with masked stores at four limits; a lane gather and a first active lane at four thresholds; the retry
+taking only the refused width; the group shapes admitted) and ours: lane ranks of `lane & 3 == 1` by `v_mbcnt_lo` and
+`v_mbcnt_hi` of the compare's mask (slot r holds lane 4 r + 1), which crosses both halves, right in the paired form and in the
+exchanged form this tree has for it. `victory-shader` 295 -> 315 passed in the full run through this port (4 ignored), the
+lane-rank test run alone after it. **Census with the switch off: 0 of 25,689 programs change. With it on: 28 compute programs
+change** (all validate): `GpuParticleEmit` 7 (`CS_Emit_Dynamic_Model*`, `CS_EmitCounts_Dynamic_Edge`),
+`GpuParticleUpdate:CS_Visibility`, `shadowmask` 2 (`CS_GenerateShadowMasks_SampleHairScreenSpace`, `...HairOnly...`),
+`sr_tracing:CS_Tiling_Generate_Opaque`, `vfx_proj_decal_trail` 9, `vfx_triangleClip` 3 (`CS_DefragHeap_ComputeRelocations`,
+`CS_CollectTriangles`, `CS_CollectTriangles_Meshlets`) and `water_shading` 5 (`CS_TransmissionVolumetrics`, `...Submerged`,
+`..._Tiled`, `..._Tiled_LocalLights`, `..._VolumePortalsOnly`). Their host pipelines (`victory translate --pipelines`): 0 of 28
+without the switch (every one `The parameter is incorrect`, 64 lanes the card does not run), 28 of 28 with it.
+
+**What the switch does in the title's world (RTX 5080, Series S, 240 s to the prison cell; `run_game_repo.ps1`).** Default
+builds log the card's refusal of 7 compute programs and drop 1.0 dispatch a frame of each of four, `GpuParticleUpdate:CS_Visibility`
+(369cbe90), `vfx_triangleClip:CS_DefragHeap_ComputeRelocations` (02384a60), `sr_tracing:CS_Tiling_Generate_Opaque` (2cc4c197) and
+`alphaResolve:CS_AlphTransmissionPrefilterMip` (2da4beb3); the other three refused (`CS_CollectTriangles_Meshlets`, the two
+water `..._Tiled*`) are made rarely. With the switch on, **three of the four run** (no refusal, no drop logged for them, nor for
+the other three), and `alphaResolve:CS_AlphTransmissionPrefilterMip` is still refused (1.0 a frame in each of about 30 log lines of each run),
+as the patch's author saw on another card (that program is not among the 28). The frame lines' own "dropped" count (about 265
+in the world: 263 against 265 with and without it) does not change. World frame, the
+median of the world lines (3,500+ draws a frame) after the first 12 of them, in ms: with the switch on 45.9, 41.8 and 42.0 (three
+runs, 19 to 25 world lines each, ranges 44.9-46.5, 41.1-46.2, 40.8-44.2); default, final build 47.4 (one run); the first-commit
+build 49.7 (a first run of that build, 10 world lines) and 46.5. The same recipe gave 41.0 to 49.0 ms on this PC for the base
+tree earlier today (41.2, 45.1 and 49.0 in `prep_r1-3`; 41.0 in `belo_r3` and `belo_r4` after the first 12 lines), so these
+numbers show no slowdown but no speed-up either: no run of the base build was made beside them (the machine's queue was long),
+and a run is warmer than the one before (shader and driver caches), the first of a build the coldest. No run ended before its time, none
+logs a device removal, a panic or an access violation (the patch's author reported one crash of two paired runs, at 216 s, on
+a different card and system). The frames captured at 4,800 show the same scene with and without the switch (camera and
+animation differ between runs; no black-and-red blocks on the jumpsuit in either, which that author saw by eye without it);
+nothing here shows a picture difference, and no frame cost of the paired form shows in these runs.

@@ -1717,3 +1717,6 @@ fn empty_and_copied_wave_masks_can_be_read_in_a_lane_branch() {
         }
     }
 }
+
+#[path = "paired_tests.rs"]
+mod paired;
