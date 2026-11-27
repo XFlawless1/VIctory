@@ -125,8 +125,8 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, USER_CB_BASE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    cb_base, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -2383,6 +2383,160 @@ mod tests {
             }
             eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
             assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+        }
+    }
+
+    /// With the constant buffer base (`VICTORY_CB_BASE`) a table's constant buffer is read at the place the host gives
+    /// in a user-data dword plus its entry's place in the table, not in the title's table (whose slot of it holds
+    /// other bytes here): the same dwords at a constant and at a computed offset, for the first entry of the table
+    /// and for another that is not (the base then lies below the block's first slot). The translation differs, and
+    /// has the dword only with the switch. The program's words are those of Belobug's test of the same name stem
+    /// (VIctory-Belobug-AMD `table_constant_buffers_read_as_raw_bytes_through_their_twins`, GPL-3.0-or-later).
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_are_read_from_their_own_base() {
+        // (The entry the constant buffer is at, its size in dwords: 64 bytes, 240 (not a multiple of 256), 16 KiB, 64 KiB.)
+        for (entry, dwords) in [(0u32, 16usize), (2, 60), (0, 4096), (2, 16384)] {
+            let last = 4 * dwords as u32 - 16;
+            let mut words: Vec<u32> = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000 | entry * 0x20, // s_load_dwordx4 s[8:11], s[4:5], entry * 0x20 (the constant buffer)
+                0xF408_0302,
+                0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV, entry 1)
+                0xF428_0404,
+                0xFA00_0000 | last, // s_buffer_load_dwordx4 s[16:19], s[8:11], the last four dwords
+                0xF420_0504,
+                0x0000_0000, // s_buffer_load_dword s20, s[8:11], s0
+            ];
+            for (out, s) in (16..21u32).enumerate() {
+                // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+                words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+                words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+                words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+            }
+            words.push(0xBF81_0000); // s_endpgm
+            let table = |kind, at| crate::UsedResource {
+                kind,
+                root: crate::RootType::Table,
+                table_offset_dwords: at,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            };
+            let native = super::NativeProgram {
+                stage: super::HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![
+                    crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                    crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+                ],
+                used: vec![table(crate::ResourceType::Cbv, entry * 8), table(crate::ResourceType::Uav, 8)],
+                io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let lowered = |on: bool| {
+                super::shader::CB_BASE_HERE.set(Some(on));
+                let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+                let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let st = crate::structure::structure(&p).unwrap();
+                let l = super::lower::lower(&super::lower::Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                })
+                .unwrap();
+                super::shader::CB_BASE_HERE.set(None);
+                l
+            };
+            let (before, after) = (lowered(false), lowered(true));
+            assert_ne!(before.dxil, after.dxil, "entry {entry}: the switch changes the translation");
+            let based = |l: &super::lower::Lowered| {
+                l.user_data.iter().filter(|u| u.root == crate::RootType::Other(super::shader::USER_CB_BASE)).count()
+            };
+            assert_eq!((based(&before), based(&after)), (0, 1), "entry {entry}: the dword is there with the switch only");
+            let data: Vec<u32> = (0..dwords as u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
+            let other: Vec<u32> = vec![0xdead_beef; dwords];
+            // (A computed offset: the last dword.)
+            let s0 = 4 * dwords as u32 - 4;
+            let at = dwords - 4;
+            let want: Vec<u32> = vec![data[at], data[at + 1], data[at + 2], data[at + 3], data[(s0 / 4) as usize]];
+            let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            for (on, l, warp) in [(false, &before, true), (true, &after, true), (false, &before, false), (true, &after, false)] {
+                let mut dxil = l.dxil.clone();
+                if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                    v.validate(&mut dxil).unwrap();
+                }
+                let Ok(host) = super::host::Host::new(warp) else {
+                    eprintln!("no adapter (software: {warp}); the dispatch is skipped");
+                    continue;
+                };
+                let cs = super::HostShader {
+                    stage: super::HwStage::Cs,
+                    dxil,
+                    user_data: l.user_data.clone(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: l.root_cbvs.clone(),
+                    root_srvs: l.root_srvs.clone(),
+                    root_uavs: l.root_uavs.clone(),
+                    root_indexed_views: Vec::new(),
+                };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                // The title's table at slot 0: junk, the UAV, and the constant buffer at its entry (the title's own
+                // view of it holds other bytes with the switch). With it the block follows the table's slots, its
+                // first slot for the entry `entry`: the base is the block's first slot less the entry, in bytes.
+                let junk = super::host::View::Cbv(&other);
+                let mut views: Vec<super::host::View> = vec![junk, super::host::View::RawUav(8)];
+                let mut cb = 0u32;
+                if on {
+                    views.extend((2..=entry).map(|_| super::host::View::Cbv(&other)));
+                    // (The title's slot of the entry first, then the block of one.)
+                    if entry == 0 {
+                        views[0] = super::host::View::Cbv(&other);
+                    } else {
+                        views[entry as usize] = super::host::View::Cbv(&other);
+                    }
+                    let first = views.len() as u32;
+                    views.push(super::host::View::Cbv(&data));
+                    cb = (first - entry) * 32;
+                } else if entry == 0 {
+                    views[0] = super::host::View::Cbv(&data);
+                } else {
+                    views.extend((2..=entry).map(|_| super::host::View::Cbv(&data)));
+                }
+                let mut user = vec![0u32; cs.user_data_dwords() as usize];
+                user[0] = s0;
+                for u in &cs.user_data {
+                    if u.root == crate::RootType::Other(super::shader::USER_CB_BASE) {
+                        user[u.index as usize] = cb;
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(user))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+                assert_eq!(got.as_deref(), Some(&want[..]), "entry {entry}, {dwords} dwords, switch {on}, software {warp}: {out:x?}");
+            }
         }
     }
 

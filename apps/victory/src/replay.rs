@@ -465,8 +465,10 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // (The AMD card the tool was made on, unless the run says its card's: `VICTORY_HOST_WAVE=32`,
+    // `VICTORY_HOST_RDNA=0` for the NVIDIA one.)
+    victory_shader::emit::set_host_max_wave(std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()).unwrap_or(64));
+    victory_shader::emit::set_host_rdna(std::env::var("VICTORY_HOST_RDNA").map_or(true, |v| v == "1"));
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

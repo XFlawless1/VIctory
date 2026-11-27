@@ -1218,6 +1218,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    crate::cbstat::log(frames);
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
