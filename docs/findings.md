@@ -411,3 +411,120 @@ no jump factor, the first frame). NOT shown: that rooms look better after walkin
 Series S title draws on the second plane (the interface, laid over the game by `compose.rs`), was saved black. It now
 reads back the composed picture when the planes were laid over each other (`VICTORY_CAPTURE_GAME_PLANE=1`: the game's
 plane alone, as before).
+
+## Belobug #454: upload ahead, a copy that did not run, and a texture being taken (2026-11-27)
+
+`VICTORY_AHEAD_SAFE` (on; `=0`: as before; A/B-able in diagnostics builds). Ported by hand from Belobug/VIctory-Belobug-AMD
+#454 (by its author, GPL-3.0-or-later; its diff did not apply, this tree having `drain`, `IN_FLIGHT` and the order that
+removes a job from those on their way after its `then` calls, which are kept). In `texture/ahead.rs`, and a few lines of
+`descriptor/host.rs`:
+
+- A batch whose copy did not run ("uploads ahead did not run") was finished all the same: its textures counted as
+  uploaded (`there()`), their slots were shown, and lists did not upload them. Now they are the lists' (`LISTED`), what
+  waited for them is not called, and no flip is made.
+- `claim` made a texture `PENDING` and put it among those on their way only after its staging buffer was made. A list
+  about to record its own upload (`listed`) in that while found nothing to wait for and went on: two uploads of one
+  texture, and the one ahead later set `uploaded` and cleared `dirty` without looking at what the list had done. Now the
+  entry is made with the taking, under the lock the list's wait takes, and whoever finds it waits (a second asking
+  waits for a second at most, as lists do).
+- The slot flips of an upload ahead had `after: 0`, ignoring `VICTORY_SHOW_NEW_LATER`: lists sent before the texture was
+  made could read its slot by index. They now wait for the submissions begun when the texture was made, as the slots of
+  the texture pass do.
+
+**Does the bug exist here.** The code does what is said, shown by two tests (`texture::ahead::tests`), each run both ways:
+`a_copy_that_did_not_run_does_not_count_as_uploaded` (without the switch the texture is `there()` and uploaded, its
+`then` calls are called; with it none of that) and `a_list_waits_for_a_texture_that_is_being_taken` (a test-only gate holds
+`claim` between taking the texture and making the staging buffer: without the switch `listed` returns at once, with it
+the list waits until the upload has landed). It has not happened in a world run on this PC: no "uploads ahead did not run"
+and no "texture not detiled" in any of the 36 run logs of the scratchpad on 2026-11-27 11:30 (21 were left at noon; with
+`VICTORY_UPLOAD_AHEAD=1` all, at least 905,000 textures uploaded ahead in those 21: the failure path is not taken).
+The race of the second point does happen: see the runs below.
+
+**Runs** (Series S, 240 s, scripted to the prison cell; world = lines of 3,500+ draws a frame; one run each, on a PC whose
+memory was nearly all taken, 0.5 to 1.0 GB available at the lowest; `tx_old1` all four switches of the three ports 0,
+`tx_cache1` only `VICTORY_FILE_CACHE=1`, so `VICTORY_AHEAD_SAFE=0` too, `tx_all1` all four on). The statistics line of the
+uploads ahead now counts the lists' waits that found a texture taken and its upload not made yet: that is the race. With
+`VICTORY_AHEAD_SAFE=0` it was 92 of 1,768 waits in `tx_old1` and 99 of 1,710 in `tx_cache1` (each of them a list that went
+on to record its own upload beside the one ahead); with it, 14 of 1,774 in `tx_all1`, which waited instead. (The counts of the two kinds
+are not of the same events: a list that goes on may ask again for its other levels.) No "uploads ahead did
+not run", no "timed out", no device removal in any of the three. World frame median 47.3 ms (`tx_old1`), 47.9 (`tx_cache1`),
+44.5 (`tx_all1`); earlier runs of the base tree today were 41.0 to 47.6, so that is the PC's spread from run to run: no sign
+of a cost, and none of a gain. Uploads ahead 55,000 / 65,000 / 60,000 (the line is logged every 5,000), "slots shown after
+their upload ... not shown any more by then" 371 / 402 / 428. What was not seen: a copy that did not run, in the game.
+
+## Belobug #470: read-only opens through the file cache, and a failed detiling retried (2026-11-27)
+
+Ported from Belobug/VIctory-Belobug-AMD #470 (by its author; it takes its two halves from avatarmanz/VIctory-7900XTX
+#423 and #419), GPL-3.0-or-later, by hand where the diff did not apply (`texture.rs`, `ahead.rs`).
+
+**`VICTORY_FILE_CACHE`** (off; `=1` on; `=0` keeps the title's `FILE_FLAG_NO_BUFFERING`, as before). In
+`victory-hle`'s `files.rs`: an open whose access is exactly `GENERIC_READ` and is not overlapped loses the flag on the
+way to the host's `CreateFileW`/`CreateFileA`, so that reads go through the system file cache (a buffered handle also takes
+reads that are not aligned); overlapped opens, opens with write access and `CreateFile2` (Bink) are as before. The log
+names the first 8 unbuffered opens and every 256th, with `cached=true` if the flag was dropped. The cache is PC memory
+(standby pages, given back when something asks for them); the PR has it on, this tree off until it is shown to help here.
+
+**Measured here** (RTX 5080, Samsung 990 PRO NVMe, 31 GB of RAM of which the title and the PC leave 0.5 to 1.5 GB;
+`tx_old1` against `tx_cache1`, one run each, not the two each that were asked for: the machine lock was not free): the log
+says the switch was active (`cached=true` on the title's unbuffered opens, `access=0x80000000 flags=0x20000000`; only 8 opens
+were named: the log names the first 8 and every 256th, so fewer than 256 were unbuffered). First frame-rate line with 1,000+ draws: 86.2 s after the
+first log line without, 83.7 s with it (eight earlier runs of the base tree today, without it: 77.9 to 88.8 s). Five-second lines before
+the world under 15 fps: 1 and 1, the worst 376 and 411 ms a frame, as in every earlier run. The PC's available memory (free
+plus standby; sampled every 10 s) at its lowest 982 and 502 MB, at the end of the run 1,301 and 1,360 MB, the zero list 56 and
+56 MB at the end; the standby list's largest 11.5 and 6.0 GB, which probably says more of what ran on the PC before each (the first sample,
+before the title: 18.3 and 17.7 GB available). `tx_all1` (the cache with the other ports) 78.4 s. So no gain that is
+outside the spread of the runs, and no sign of the memory cost either, on this drive; the original report's
+gain (RX 7800 XT, 5 s sooner) and the PR's own NVMe measurement (unchanged, 6.1 to 6.3 s to the first frame) are the other two data. Left off
+until a run on a slow drive or with a cold cache shows more. Not measured: a cold cache (reboot), the load stutter beyond
+the five-second lines.
+
+**`VICTORY_DETILE_RETRY`** (on; `=0`: as before; A/B-able). `Staging::detile` says whether it detiled, after checking every
+part of the texture against the bounds `Layout::detile` checks (`Layout::check_detile`, in `victory-formats`) before it
+writes any, and `Last::convert` notes the memory's digest (or the write-watch's asking) only when it did. Before, the digest
+was noted before the conversion: a texture whose detiling failed ("texture not detiled") was never tried again while its
+memory stayed as it was, and kept the parts the failure had written, which went up with the next upload. A job of the upload
+ahead whose staging buffer is incomplete is left out of its batch and is the lists' (`refresh_all`, the others go on).
+Not taken from the PR: its change to the partly mapped path that stopped noting the digest of memory that reads as
+all zeros (kept as it always was); its prelude claim (this tree has no prelude upload).
+
+**Does the bug exist here.** In the data structure, yes: `unchanged_input_retries_a_failed_detile_then_skips_a_completed_one`
+(`texture::detile_retry`) runs the same refresh both ways, and as before a failed conversion is counted done and the same
+memory is never converted again; with the switch it is converted again and then skipped. In a world run it has not
+happened: "texture not detiled" appears in none of the 36 logs of the scratchpad (and the PR's own table of warnings
+shows none either, so what it measured between its two runs is not this fix).
+
+**Runs.** "texture not detiled" in `tx_old1` (`VICTORY_DETILE_RETRY=0`), `tx_cache1` (0) and `tx_all1` (on): 0, 0, 0, and no
+device removal; the retry never ran in the game here, so what a failed detiling does to the picture was not seen, and the
+only evidence of the fix is the tests (`texture::detile_retry`, `texture::ahead::tests`, `Layout::check_detile`'s). With it
+on the world frame median of `tx_all1` was 44.5 ms against 47.3 and 47.9 (see #454: one run each).
+
+## Belobug #424: the states of the buffers lists use directly (2026-11-27)
+
+`VICTORY_BUFFER_STATES` (off; `=1` on; `=0`: as before, no state tracked, no barrier recorded, no allocation: the lists are
+what they were). Ported from Belobug/VIctory-Belobug-AMD #424 (by its author; its issue #350), GPL-3.0-or-later;
+`host/buffers.rs` is its module, the rest by hand (`host.rs`, `draw.rs`, `indirect.rs`, `host/place.rs`). Each host list
+tracks the state of the card-side buffers it binds directly (root views of a draw or dispatch, vertex and index buffers,
+the source of an indirect clamp) and of those it copies into or out of. `place_copy` and `place_source` bring their
+buffers back to the common state after the copy: a `CopyBufferRegion` promotes its destination from the common state to
+`COPY_DEST`, nothing took it out, and the compare list `plan.check` of the same submission read it as a root shader
+resource (id 538 of the debug layer, "COPY_DEST promoted from COMMON is invalid for use as a root shader resource",
+#350). A list's prelude brings a buffer an earlier list of the same `ExecuteCommandLists` left in another state back to
+common, and the compare list moves what is left in a write state to a read state. Not taken: the PR's debug-layer test
+(`copies_in_place_leave_their_buffers_to_root_views`, ignored; it needs the layer).
+
+**The D3D12 debug layer is not on this PC** (no `d3d12SDKLayers.dll` in `System32`, `SysWOW64` or the driver store: the
+Windows optional feature "Graphics Tools" is not installed, and installing it was not asked for), so error 538 cannot be
+counted before and after here. What is checked instead is what the host list records: `a_copy_into_a_host_copy_is_left_promoted_unless_the_states_are_tracked`
+(`host::place::tests`) shows that without the switch a `place_copy` into a host copy in the card's memory tracks nothing
+and records nothing that takes the buffer out of `COPY_DEST`, and with it the buffer ends in the common state;
+`place_copy_restores_buffer_to_common_and_runs_cleanly` and the five state-machine tests of `host::buffers` are the PR's.
+Whether #350's device loss has anything to do with it is not known (its author says it was not this).
+
+**Frame time.** `tx_all1` (this switch on, with the three other ports) 44.5 ms median in the world, against 47.9 ms for
+`tx_cache1` and 47.3 for `tx_old1` (neither tracks buffer states): one run each, whose spread is as large as the
+differences, so no cost shows and no gain; the pairs of runs each side that were asked for were not made (the machine lock
+was not free, and the time box). The recording threads do the extra work only where a draw binds a root view, a vertex or
+index buffer of a host copy directly, and for `place_copy` and indirect clamps (a hash lookup and a lock a call); the log of
+`tx_all1` has no device removal. Left off by default: nothing here shows the switch to help (error 538 could not be
+counted), and a wrong state in a barrier is a way to break a picture; what would justify turning it on is a run with
+`VICTORY_D3D12_DEBUG=1` on a PC with Graphics Tools that shows 538 gone and the picture unchanged.
