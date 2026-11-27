@@ -1361,6 +1361,8 @@ pub(crate) fn want_level(this: This, first: u32) {
     crate::texture::unstage(this);
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::capture::bio(this, "replaced", first);
     if let Some(old) = made.take() {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
@@ -1627,6 +1629,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::bio(
+            this,
+            if host.grown.load(Relaxed) {
+                "made-after-replace"
+            } else if r.host.gone.load(Relaxed) {
+                "made-after-sweep"
+            } else {
+                "made"
+            },
+            base,
+        );
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2272,7 +2286,7 @@ fn listed_census_mode() -> u32 {
 }
 
 /// `VICTORY_STALE_AT_BAKE=<n>`: the same census, `n` as above, at the pass
-/// before a draw of the title's bake (at most every 8th frame): what the
+/// before a draw of the title's bake (at most every 16th frame): what the
 /// bake takes from its sources stays in what it makes.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn bake_census_mode() -> u32 {
@@ -2359,8 +2373,13 @@ fn stale_census_with(frame: u64, mode: u32, most_bytes: u64) {
                     }
                     if shown < 60 {
                         shown += 1;
+                        let detail = crate::texture::stale_detail(this);
+                        let (base, ahead) = made_copy(this).map_or((0, 0), |c| (c.base, c.ahead.load(Relaxed)));
                         tracing::info!(
                             frame,
+                            detail = %detail,
+                            base,
+                            ahead,
                             memory = format_args!("{memory:#x}"),
                             bytes = size,
                             width = r.desc.width,
@@ -2531,6 +2550,33 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
         return None;
     }
     hosted(this, false).map(|made| made.0)
+}
+
+/// Whether `this` is a 2D block-compressed texture of at most 256 texels
+/// across, of the kind the title's bakes make.
+#[cfg(windows)]
+pub(crate) fn is_small_bc(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension == 3 && matches!(r.desc.format, 70..=84 | 94..=99) && r.desc.width <= 256
+}
+
+/// Diagnostics: the host copy title texture `at` has now, if it is still
+/// alive (it is named by address: it may have been freed since a note was
+/// made) and has one.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn current_copy(at: usize) -> Option<std::sync::Arc<HostTexture>> {
+    let all = textures();
+    if !all.contains(&at) {
+        return None;
+    }
+    // SAFETY: a texture leaves the table before it is freed, under the lock
+    // held here (`Drop for Resource`).
+    let r = unsafe { &*(at as *const Resource) };
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(host, _)| host.clone())
 }
 
 /// A host texture like the title's: same description, in GPU memory,

@@ -158,12 +158,13 @@ fn auto_watch(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &
             let (r, g, b) = if bgra { (i32::from(p[2]), i32::from(p[1]), i32::from(p[0])) } else { (i32::from(p[0]), i32::from(p[1]), i32::from(p[2])) };
             light += ((r * 3 + g * 6 + b) / 10) as u64;
             seen += 1;
-            if r >= 90 && r - g >= 28 && b - g >= 8 && r - b <= 70 && r >= b {
+            // The waitress's shirt: red, with green and blue at 0.70 and 0.67 of it.
+            if r >= 120 && ((g as f32 / r as f32) - 0.70).abs() < 0.05 && ((b as f32 / r as f32) - 0.67).abs() < 0.06 {
                 pink += 1;
             }
         }
     }
-    if seen > 0 && light / seen < 70 && pink >= 2500 {
+    if seen > 0 && light / seen < 70 && pink >= 2000 {
         AUTO_LEFT.store(frames, Relaxed);
         AUTO_NEXT.store(n + 4, Relaxed);
         tracing::info!(frame = n, pink, "the diner is on the picture: the frames after it are listed (VICTORY_AUTO_DINER)");
@@ -647,6 +648,38 @@ fn dump_bc_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_BC"))
 }
 
+/// By resource: what happened to a small block-compressed texture of the
+/// title's, in order (frame, what, argument), the first 80 events; written
+/// to the index of the dump of each listed frame.
+#[cfg(feature = "diagnostics")]
+static BIO: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<(u64, &'static str, u32, u32)>>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes `what` (with `arg`: a level, a first level, a subresource) of title
+/// texture `resource` for its biography, if it is a small block-compressed
+/// texture and `VICTORY_DUMP_BC=1`. A note like the last one of the frame is
+/// not kept again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bio(resource: crate::object::This, what: &'static str, arg: u32) {
+    bio_in(resource, what, arg, 0);
+}
+
+/// [`bio`] of something a list records: `list` is the list's address (0: none),
+/// of which the biography keeps a few digits, to tell the lists apart.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn bio_in(resource: crate::object::This, what: &'static str, arg: u32, list: usize) {
+    if resource.is_null() || !dump_bc_on() || !crate::resource::is_small_bc(resource) {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    let list = (list >> 4) as u32 & 0xffff;
+    let mut all = BIO.lock().unwrap_or_else(|e| e.into_inner());
+    let events = all.get_or_insert_with(Default::default).entry(resource as usize).or_default();
+    if events.len() < 80 && events.last() != Some(&(frame, what, arg, list)) {
+        events.push((frame, what, arg, list));
+    }
+}
+
 /// Notes the destination of a copy of the title's, if it is block-compressed.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn note_copied_into(resource: crate::object::This) {
@@ -686,7 +719,17 @@ fn dump_baked(frame: u64) {
     let held: Vec<_> = BAKED.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     let mut total = 0u64;
     let mut saved = 0usize;
-    for (i, (resource, copy)) in held.iter().enumerate() {
+    // Whether the host copy each texture has now is the one the first copy
+    // wrote (the title samples the one it has now: one replaced by a copy
+    // with more levels is dumped as it is).
+    let mut state_of = vec!["gone"; held.len()];
+    for (i, (resource, first_copy)) in held.iter().enumerate() {
+        let (copy, status) = match crate::resource::current_copy(*resource) {
+            Some(now) if std::sync::Arc::ptr_eq(&now, first_copy) => (now, "same"),
+            Some(now) => (now, "replaced"),
+            None => (first_copy.clone(), "gone"),
+        };
+        state_of[i] = status;
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -739,11 +782,21 @@ fn dump_baked(frame: u64) {
     // The frames of the copies, in the order the files are numbered.
     {
         let when = BAKED_WHEN.lock().unwrap_or_else(|e| e.into_inner());
+        let bios = BIO.lock().unwrap_or_else(|e| e.into_inner());
         let mut text = String::new();
         for (i, (resource, _)) in held.iter().enumerate() {
             let (first, last, copies) = when.as_ref().and_then(|m| m.get(resource).copied()).unwrap_or_default();
-            text.push_str(&format!("{i} {resource:#x} first_copy_frame {first} last_copy_frame {last} copies {copies}
-"));
+            let events: Vec<String> = bios
+                .as_ref()
+                .and_then(|m| m.get(resource))
+                .map(|e| e.iter().map(|(f, what, arg, list)| format!("f{f}:{what}:{arg}@{list:x}")).collect())
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "{i} {resource:#x} first_copy_frame {first} last_copy_frame {last} copies {copies} host_copy {} | {}
+",
+                state_of[i],
+                events.join(" ")
+            ));
         }
         let _ = std::fs::write(folder.join(format!("frame-{frame}-bc-index.txt")), text);
     }
