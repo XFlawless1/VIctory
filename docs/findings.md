@@ -528,3 +528,85 @@ index buffer of a host copy directly, and for `place_copy` and indirect clamps (
 `tx_all1` has no device removal. Left off by default: nothing here shows the switch to help (error 538 could not be
 counted), and a wrong state in a barrier is a way to break a picture; what would justify turning it on is a run with
 `VICTORY_D3D12_DEBUG=1` on a PC with Graphics Tools that shows 538 gone and the picture unchanged.
+
+## Physical pages in sections of 2 MiB (upstream VIctory #3177, 2026-11-27)
+
+`VICTORY_SECTION_MB=<n>` (default 2 on Windows and 0 under Wine; `0`: one section per allocation, as always). Ported by hand
+from Marvisak/VIctory pull request #3177 by KainanP (the idea and first patch are RyanCase94's, fxceless/victory-fork#1089; the
+PR's `physical_remap_bench` is kept, ignored), GPL-3.0-or-later. The claim: Windows' large-page rebuild worker trades a
+section's physical pages one at a time and walks the section's views while it holds the section's lock, and the title asks
+for its pages in one call and maps them 64 KiB at a time, so one section carries views by the hundred thousand and every map
+and unmap of the title's pages waits behind that lock. In 2 MiB sections a trade walks a few dozen views. Here
+`XMemAllocatePhysicalPages` makes the sections (`make_sections`), `number_pages` numbers the pages on as before, and a run of
+pages (a view, a window of ours, a DirectStorage write in place, `inplace::beside`) ends at a section's end. Kept from this
+tree: `title_memory_section` once for each section with its own size, the page numbers written after the page-table lock is
+let go, `Section`'s window and committed bitmap per section. Not in the PR: more than 65,536 sections are never made; on the
+GPU side `inplace.rs` holds sections and our whole-section views in maps (a list searched at every write was fine for four
+sections, not for thousands), forgets a section when the runtime lets it go (it was kept: a later `beside` on a view of it
+would have mapped a closed handle), and prints one census line a size. The `M` lines of `VICTORY_DSTORAGE_LOG` now also count
+the title's mapping calls of 1 ms or more and of 10 ms or more, and the DirectStorage writes that needed more than one run of
+pages (count, bytes).
+
+**Does the stall exist here: yes, and the sections remove it.** The standard scripted run (240 s of Enters, the cell from
+about 85 s), alternating old, new, old, new (`xm_o1 xm_n1 xm_o2 xm_n2`, 2026-11-27 16:25 to 18:28; the same binary both
+ways, only `VICTORY_SECTION_MB` differs; frame capture off, because its saves are 16 hitches a run; `VICTORY_LOG=info,victory_gpu::frame=debug`
+for a line a frame, `VICTORY_DSTORAGE_LOG` for the `M` lines). Two runs each way, not three: the machine lock's queue was an hour
+long. "world" is from the first line of 1,000 draws to the end (155 s, loading the cell and then standing in it); "last 60 s" is
+the standing-still part. Old = `VICTORY_SECTION_MB=0`, new = 2; each cell is the two runs, in order.
+
+| | old | new |
+|---|---|---|
+| first line of 1,000 draws, s | 84.6, 86.9 | 84.1, 83.0 |
+| title's mapping calls, ms per second: opening | 55.9, 80.7 | 25.2, 21.9 |
+| ... world | 206.3, 119.6 | 33.5, 30.5 |
+| ... last 60 s | 10.8, 13.6 | 12.7, 10.3 |
+| mapping calls of 1 ms or more: opening | 464, 688 | 103, 95 |
+| ... world | 4,276, 2,671 | 552, 377 |
+| ... of 10 ms or more, world | 394, 212 | 4, 10 |
+| longest mapping call, world, ms | 439, 189 | 26, 24 |
+| GPU page-mapping copies, ms per second, world | 161.6, 103.3 | 30.8, 28.8 |
+| mapping lock wait, ms per second, world | 92.4, 42.9 | 2.4, 2.0 |
+| frames over 100 ms: opening | 26, 22 | 20, 19 |
+| ... world | 84, 50 | 29, 17 |
+| worst world frame, ms | 875, 542 | 140, 142 |
+| world frame p99, ms | 179, 118 | 98, 86 |
+| frames over 50 ms: opening | 62, 73 | 69, 66 |
+| ... world (of 3,038 to 3,501) | 832, 779 | 1,164, 716 |
+| world median, ms (3,500+ draws lines / present gaps) | 44.0, 43.6 / 44.9, 43.3 | 46.3, 42.7 / 47.7, 42.2 |
+| last 60 s median, ms (present gaps) | 43.4, 41.3 | 46.2, 39.6 |
+| DirectStorage writes in several runs (staged, copied): count, GB | 6,294, 6,637; 2.65, 2.78 | 7,374, 7,319; 3.06, 3.05 |
+| launcher private bytes (commit) highest, MB | 23,765, 24,322 | 23,835, 23,913 |
+| launcher working set highest, MB | 20,952, 21,777 | 19,430, 20,988 |
+| system available memory at the end / lowest, MB | 2,849, 1,772 / 676, 1,406 | 1,927, 1,817 / 570, 911 |
+| device removals | 0, 0 | 0, 0 |
+
+What the two ways differ in: the title's mapping calls cost 4 to 6 times less in the world part, the longest took 26 ms or less (old
+189 and 439), the lock the GPU's page-mapping copies share with them is free (2 ms a second against 43 and 92), and the long
+frames are fewer and shorter (frames over 100 ms 84 and 50 against 29 and 17, worst frame 542 and 875 against 140 and 142, p99
+118 and 179 against 98 and 86): the PR's own finding, here on an RTX 5080. What they do not differ in: the time to the
+first world line (the opening's frames over 100 ms are 20 against 24 on average, its over 50 ms 68 against 68), the
+standing-still part (mapping 11 to 14 ms a second either way: "standing still hid it"), and the world frame's median: the
+last 60 s was 43.4 and 41.3 ms old and 46.2 and 39.6 ms new, so the spread of one way (up to 6.6 ms) is larger than the
+difference between the ways; the frames over 50 ms in the world part (832 and 779 old, 1,164 and 716 new) follow that spread and
+not the sections. The first new run was the slow one (host copies 15.7 ms against 14.9 and 14.5 old, landing merge 5.06 against
+4.75 and 4.49, everything else the same) and the second the fastest of the four (13.7 ms, 3.88): no change of the frame is
+shown. DirectStorage writes that needed more than one run of pages were already 6,300 to 6,600 (they cross allocations); the
+sections add about 900 (about 340 MB more staged and copied, over the whole run, not seen in a frame line).
+
+**Memory.** None of the figures is outside the range the old way showed between its two runs, except the lowest available
+memory (570 and 911 against 676 and 1,406 MB), which follows what the PC held at the start of each run (3.9 and 6.0 GB
+available against 6.4 and 19.3 GB). The title's commit is the same to 0.1 GB; about 3,100 section handles for a 6.1 GiB request
+(in run n1 four requests of 110, 149, 93 and 1,989 sections, made in 0.1 to 2.9 ms each) cost nothing measurable. No device removal:
+the only log lines with "device-removed" or "timeout detection" are the start-up lines that name those settings.
+
+**Not measured.** A walk. A scripted walk from the cell (`VICTORY_KEYS=<from>-<to>:W` holds a key) was not run: no slot of
+the machine lock in the time box. So the case the PR's authors measured, walking and driving, where the title maps all the
+time, is not covered: the cell's world part here is loading the cell and then standing still. The 340 MB more of staged
+writes is a cost the loading of the world pays and a walk may pay more of. Not run: the PR's benchmark (it maps 4 GiB: more
+than the PC has free while agents work); a section size between (4 to 64 MiB); a third pair of runs; a cold cache.
+
+**Decision.** On by default on Windows (`DEFAULT_SECTION_MB = 2`; `VICTORY_SECTION_MB=0` is the old way, and the default
+under Wine), in a commit of its own, from two runs each way that agree on every number the PR's authors used (stalls, long
+frames) and show no cost in the frame's median, in memory or in device losses. What would argue for turning it off: a walk or
+a drive that shows the staged DirectStorage writes costing more than the stalls saved. The tests (`modules::xmem::tests`, 8 new
+and the PR's ignored benchmark; `inplace::tests::many_small_sections_each_have_a_view_of_their_own`) pass with `=0` and `=2`.
