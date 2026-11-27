@@ -614,3 +614,127 @@ whoever finds the device removed.
 Tests: `cargo test -p victory-gpu --features diagnostics --lib` 389 -> 390 (the new one is
 `the_removal_phase_counts_unfinished_submissions`). **Not exercised in a run**: no device was removed in any run here, so
 the new report text has only been seen through its unit test.
+
+## kelvaroq's patch series, ported and measured here (2026-11-27)
+
+`stellarr-studio/kelvaroq` publishes a patch series (`native/patches`, GPL-3.0-or-later) written against
+fxceless/victory-fork f85101b, not against this tree: the hunks mostly miss, so what is taken was ported by hand, and each
+commit names its patch. The patches are read, never run.
+
+**0009, the cut of a parallel scan (`shadow.rs`; a bug fix, so no switch).** `Shadow::differing` compares a range of a host
+copy with its snapshot on up to eight threads (one per 16 MiB, so from 32 MiB), each share starting at a cut backwards to a
+piece boundary of title memory, `at - (start + at) % PIECE`. For the first share `at` is the range's own start, and when
+that is below its offset into the piece (a copy whose title address is not a multiple of 64 KiB, a range at the copy's
+start) the subtraction goes below zero: a panic where overflow checks are on, and in the diag and release builds a wrapped
+cut that `.max(from)` leaves huge, from which nothing is scanned: the first share, 16 MiB or more, was never compared and
+what shaders wrote there was not copied back. The scan is now a function over plain memory (`differing_pieces`, cut by
+`scan_boundary`, saturating as kelvaroq's patch has it), and `scan_cut_tests` runs the cut on its own and the whole scan
+against a serial one, over unaligned title addresses and starts: with the old formula both panic, `attempt to subtract
+with overflow`; with the fix they pass. The other two cuts of this kind in the file (`find_pieces`, `copy_wide`) cannot go
+below their start. Not shown: that the title has such a range (an unaligned copy start with a range of 32 MiB or more from
+the copy's start); the world's big heap copy is 100-170 MB, and its start is not known to be unaligned.
+
+**0061, `VICTORY_NO_DRAWS=1` (a measuring switch: unset, or any other value, is as before).** No host pipeline is made and no
+shader is translated: `pipeline::host_pipeline` gives none, a pipeline known from earlier runs is not started when the title
+creates it, and the structure builder stays off. Every draw, dispatch and indirect execution of the title is dropped and the
+picture stays black; what a frame costs is the title's own code and the part of our work that does not wait for a draw (its
+calls into our lists, their walk, fences, presents). Taken as kelvaroq's patch has it (a switch of the same name in Cold
+Project VI); added here: the creation-time start of known pipelines is left out too, and a dropped draw is not counted by
+reason (diagnostics builds took a lock and made a string for each, on the threads that replay the lists).
+Measured (RTX 5080, Series S, 240 s, scripted keys to the prison, the frame lines that had 3,500+ draws and dropped
+commands a frame, the first 6 of them left out): **33.3 ms (30.0 fps) in every line from the 7th on (17 of 17), one run**
+(`kq_nodraws1`); 3,600-3,800 draws and dispatches and about 4,600 indirect executions dropped a frame, the submission
+preparing 0.7-0.9 ms (copies 0.1 ms; no texture slot placed: nothing is made that a draw does not bind), `Present` 0.30 ms, no
+device loss, no warning but the switch's own, the black frames and the present-plane notes. The title's cutscenes show 33.3
+ms in the same build with draws too, so 33.3 ms is the title's own limiter for 30 fps (the host presents with sync interval
+0): with every draw dropped the title and our walk of its lists fit inside it, and the frame time cannot show how far below.
+The same keys without the switch, same build (the runs section below has them all): the cell's frame settles at 39.2 ms
+(base2, the last 8 quiet-cell lines, 4,440 draws a frame; the whole cell's median 40.5 ms), 44-46 ms before it does so (and
+in two of five quiet runs only at the very end or not at all within 240 s), and in one run (base1) the scene went on to a
+state with 6,200 draws and 59 ms.
+What the gap says: the title's code is not the wall: it and our walk fit inside 33.3 ms with every command of a frame
+recorded and dropped (3,700 draws and dispatches and 4,600 indirect executions a frame); of the cell's 39 ms at least 5.7 ms
+(15 %) is drawing, of the 44-46 ms before the settle at least 11-12 ms: what our host does for draws (translation's pipelines,
+copies, uploads, descriptors, the replay of the lists) and the card. Not shown: the real floor under the cap (burning CPU in
+the list calls until the frame leaves 33.3 ms would give it; `VICTORY_BURN_CPU_US` burns on the submitting thread only; one
+`VICTORY_NO_DRAWS=1` run, a second was not made), and whether the title takes other paths when no GPU result comes back (it
+did not stall or crash in this run).
+
+**0042's counters of the clamps (diagnostics: the frame line's neighbour "indirect clamps per frame").** kelvaroq's 0042
+counts the clamps of one execution or window by the kind of their records; here those are counted too, and so are our
+batches (`indirect::batch`, 256 jobs a pass): the passes, the executions that read them by kind, and what a batch held when
+it ended (mesh dispatches only, others only, both). The patch's other half (why a merge under flights' shader writes gave
+up, `VICTORY_LATE_WAIT=2` only) is not taken. In the cell (RTX 5080), 4,460 draws a frame: 155 passes a frame, none alone
+or in windows, 3,260-3,280 mesh dispatches, 900-910 dispatches, 260 draws and 83 indexed draws reading their records from
+them, in 25 batches of mesh dispatches only, 124 of dispatches and draws only and 6 of both; in the state with 6,200 draws:
+161-166 passes, 2,300-2,480 mesh dispatches, 940-960 dispatches, 18-20 batches of mesh only, 128-130 of the others, 15 of
+both. Two full waits for every earlier shader write per pass: about 310 a frame, against the title's own barrier groups' 690
+(the cell) to 780 (the other state).
+
+**0041, the mesh launch (not ported: nothing to gain that the numbers show).** The patch's hash half is here already
+(`CARD_COMPARE` is 64 threads a piece). Its launch half puts an amplification stage of its own in front of every mesh
+shader, which reads the title's record where the title wrote it, bounds and charges it as the clamp does, and launches the
+groups, so that an indirect mesh draw needs no clamp pass before it; kelvaroq measured it against an unbatched clamp (two
+full waits for every record: 3,200 of 3,950 full waits in a frame). What was measured here, in order:
+- The bench this tree has (`indirect::bench`, `cargo test -p victory-gpu --features diagnostics --lib indirect::bench --
+  --ignored --nocapture`; RTX 5080, 3,200 one-record draws a frame, medians of 9): windows of 32 as `main` clamped them
+  30.40 ms, as this tree does 0.64 ms (-97.9 %); one at a time 14.19 and 13.97 ms. That is kelvaroq's issue 22
+  ("3,200 draws 30.54 -> 0.64 ms"): the cost of an unbatched clamp that the patch removes is gone here since the
+  barriers and the one charge per group, and the batched pass (`VICTORY_INDIRECT_BATCH`) after them.
+- What is left is the batched passes: 155 a frame in the cell (counters above), each with two full waits, 310 against the
+  title's 690. The batch is shared by all kinds, and the patch can take out only the mesh dispatches' clamps: 25 of the 155
+  batches hold mesh dispatches only (and 6 more some), 124 hold only dispatches and draws, which the launch does not touch.
+  Even if all 155 passes cost what the bench's cost (0.64 ms for 100 passes and 3,200 draws, so at most 6.4 us a pass on an
+  idle card), the 25 are at most 0.16 ms of a frame of 40-57 ms, and nothing in the 130 others' way changes.
+- The clamp passes' waits (all 155 passes' two each, not only the mesh ones') taken out in a world run
+  (`VICTORY_BARRIER_TEST=indirect`, for timing only: nothing then orders a clamp after the title's writes), which is more
+  than a launch could save: the cell's frame 39.2 ms with them, 39.0 ms without (last 8 quiet-cell lines of base2 and bt2;
+  the runs section below); bt1, the other run, was 43.5 at the end, and only because it had not settled yet.
+- Cannot be done as asked here either: the amplification stage is shader model 6.6, and the host shaders of this tree are
+  compiled by `D3DCompile` (FXC, `cs_5_1` and the like); `dxc` is found only by the tests, in the Windows SDK. The patch's
+  stage is a compiled DXIL blob (`launch_code.rs`), not taken. Our DXIL emitter (`victory_shader::emit`) has no
+  amplification stage, no `DispatchMesh` and no payload; writing them is new surface, and the translated mesh shaders would
+  all declare a payload (`MESH_PAYLOAD_BYTES`), so `TRANSLATOR_VERSION` would go up and every cache start cold.
+So the measurement says the clamp cost left is small and mostly not in mesh dispatches' share; nothing is changed.
+
+**0046 and 0048, presents behind the lists, two frames ahead (not ported: this tree has it, and the cost is not here).** The
+patch makes the title's `Present` return at once: it takes one of `VICTORY_FRAMES_AHEAD` slots (2 by default), puts the
+present into the queue's line behind the lists and signals before it (`Held::Present`), and the copy to the back buffer runs
+when the line reaches it, from a texture the present holds; the slot is given back when the card has run that copy. A
+title's blocking fence wait (no event) waits on an event of its own that the relay publishes; the worker looks at a blocked
+head every 4 ms; `VICTORY_EARLY_BARRIERS=1` (off) records the preludes while the relay lands bytes; `frame_wait.rs` times
+both sides of the handoff. 0048 makes it the default. In this tree the title's `Present` already does not wait for the card
+with the relay (`VICTORY_RELAY=2` is in the play set: `late_free_present`, the copy is a flight of its own, `Present` is told
+behind it), and with `VICTORY_ASYNC_SUBMIT=1` all queue calls, presents included, go through one line served by a thread of
+ours (`queue/behind.rs`: `VICTORY_SUBMIT_FRAMES` presents ahead, 1 by default; the title drains only before a read-back or a
+blocking fence wait). Measured: the host's `Present` call blocks 0.30-0.45 ms a frame in every world run of this session and
+in a whole 81-line run of 2026-11-26 (including a 184 ms frame: 0.5 ms), and the flights are settled 0.0 times a frame in all
+of them: the 0.1 ms and the 10-12 ms of settles that the patch removes are not in these frames. What would be new: the slot
+that stays until the card has run the present copy, the event-based fence wait, the 4 ms look, the early preludes; none
+addresses a cost this tree shows. Our own equivalent (`VICTORY_ASYNC_SUBMIT=1`, `VICTORY_SUBMIT_FRAMES=2`) against the
+default: 39.2 ms (base2) and 38.9 (async2) once settled, async1 had not settled at the end (44.0); the thread of ours worked
+35-39 ms of every frame of 40-44, the title waited 0.0 ms at presents and for room in both modes: no gain to take (the
+runs section below).
+
+**Runs of this section (RTX 5080, Series S, 240 s each, `run_game_repo.ps1`, the keys that reach the prison in about 4 minutes,
+the diag build of the branch's tip; no device loss in any; `Present` blocked 0.30-0.45 ms a frame in all).** The cell
+differs between runs: the log's draws a frame say 4,430-4,530 in five runs and 6,200 in one (base1: the scene went on to the
+guard at the door), and the cell's frame is 44-46 ms for the first minute or two and 39 ms after a step down, which came
+well within the 240 s in three of the five quiet runs (base2, bt2, async2), in the last three lines of a fourth (bt1) and not
+at all in async1. So the median of all world lines (the first 6 left out) is shown beside the median of the last 8 lines of
+the quiet cell (4,300-4,800 draws a frame):
+
+| Run | What | Draws a frame | All world lines | Last 8 quiet lines |
+|---|---|---|---|---|
+| base1 | as built | 6,206 | 57.2 ms (27 lines) | none (the scene had moved) |
+| base2 | as built | 4,443 | 40.5 ms (26) | 39.2 ms |
+| bt1 | `VICTORY_BARRIER_TEST=indirect` | 4,459 | 44.8 ms (29) | 43.5 ms |
+| bt2 | the same | 4,427 | 39.8 ms (23) | 39.0 ms |
+| async1 | `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_SUBMIT_FRAMES=2` | 4,531 | 44.9 ms (20) | 44.0 ms |
+| async2 | the same | 4,465 | 40.0 ms (29) | 38.9 ms |
+| nodraws1 | `VICTORY_NO_DRAWS=1` | 0 (3,700 + 4,600 dropped) | 33.3 ms (22) | 33.3 ms |
+
+The same configuration differs by up to 5 ms between runs (bt1 against bt2) when one has not stepped down, so differences
+under that are not shown by one pair: base2 against bt2 -0.2 ms and base2 against async2 -0.3 ms are nothing, and no claim
+is made from them, except that the clamp waits and the async line do not hold the frame at 39 ms either. Tests of this
+tree: 393 in `victory-gpu` (391 at 3f687f24 and the two of 0009), 295 in `victory-shader`.

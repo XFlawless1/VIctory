@@ -283,6 +283,17 @@ struct Batch {
     /// Dispatches since, which may have written arguments
     /// (`VICTORY_INDIRECT_BATCH=2`).
     wrote: bool,
+    /// Diagnostics: the kinds of the executions it clamped for
+    /// ([`crate::indirect::kind_bit`]).
+    #[cfg(feature = "diagnostics")]
+    kinds: u8,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Batch {
+    fn drop(&mut self) {
+        crate::indirect::batch_closed(self.kinds);
+    }
 }
 
 /// The host copies arguments were read from last: what a batch opens with,
@@ -3969,6 +3980,10 @@ impl State {
         if let Some(b) = &mut self.batch
             && let Some(at) = b.table.place(id, offset, kind)
         {
+            #[cfg(feature = "diagnostics")]
+            {
+                b.kinds |= crate::indirect::kind_bit(kind);
+            }
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
@@ -3976,7 +3991,13 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
-        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        self.batch = Some(Batch {
+            table,
+            scratch: scratch.clone(),
+            wrote: false,
+            #[cfg(feature = "diagnostics")]
+            kinds: crate::indirect::kind_bit(kind),
+        });
         Some((scratch, at))
     }
 
@@ -4080,6 +4101,8 @@ impl State {
         };
         if batch.is_some() {
             self.window = None;
+            #[cfg(feature = "diagnostics")]
+            crate::indirect::counted_batched(kind);
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no

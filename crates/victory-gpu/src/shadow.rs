@@ -1420,6 +1420,137 @@ fn for_pieces_of(from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
     }
 }
 
+/// Where a thread's share of the span `[from, ..)` being scanned starts, when
+/// it would start at `at` (at or above `from`): cut backwards to a piece
+/// boundary of title memory (`start` is the copy's title address), but not
+/// below `from`. A span that does not start on a piece, cut at its own start,
+/// has `at` below its offset into the piece: subtracting that wrapped
+/// around, and the thread that got the wrapped cut scanned nothing.
+fn scan_boundary(start: usize, from: usize, at: usize) -> usize {
+    at.saturating_sub((start + at) % PIECE).max(from)
+}
+
+/// The 64 KiB pieces (cut at multiples of 64 KiB of title memory, `start`
+/// being the copy's title address) of `[from, to)` of the copy at `data`
+/// that differ from `before` (the snapshot's bytes from `from` on), as
+/// (offset, bytes) in order; compared on several threads when the range is
+/// big.
+///
+/// # Safety
+/// `data + from .. data + to` is valid for reads and nothing writes it
+/// meanwhile; `before` holds `to - from` bytes.
+unsafe fn differing_pieces(start: usize, data: usize, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
+    let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut at = a;
+        while at < b {
+            let n = (PIECE - (start + at) % PIECE).min(b - at);
+            // SAFETY: inside the range the caller vouches for.
+            let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+            if host != &before[at - from..at - from + n] {
+                found.push((at, n));
+            }
+            at += n;
+        }
+        found
+    };
+    const PER_THREAD: usize = 16 << 20;
+    let threads = ((to - from) / PER_THREAD).clamp(1, 8);
+    if threads == 1 {
+        return scan(from, to);
+    }
+    // Cut on piece boundaries, so that every thread sees whole pieces.
+    let cut = |i: usize| {
+        if i == threads {
+            return to;
+        }
+        scan_boundary(start, from, from + (to - from) / threads * i)
+    };
+    let scan = &scan;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..threads)
+            .map(|i| {
+                let (a, b) = (cut(i), cut(i + 1));
+                s.spawn(move || scan(a, b))
+            })
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|part| match part.join() {
+                Ok(found) => found,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod scan_cut_tests {
+    use super::{PIECE, differing_pieces, scan_boundary};
+
+    /// The pieces of `[from, to)` that differ, one thread, piece by piece:
+    /// what `differing_pieces` must give whatever the threads cut.
+    fn serial(start: usize, from: usize, to: usize, data: &[u8], before: &[u8]) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        let mut at = from;
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            if data[at..at + n] != before[at - from..at - from + n] {
+                found.push((at, n));
+            }
+            at += n;
+        }
+        found
+    }
+
+    /// A span of 48 MiB (three threads) from `from`, whatever `from` and the
+    /// title address are: the first thread's share starts at `from`, the
+    /// others on a piece, in order.
+    #[test]
+    fn unaligned_parallel_scan_covers_the_first_piece() {
+        let span = 48 << 20;
+        for start in [0, 1, 31, PIECE - 1] {
+            for from in [0, 1, 31, PIECE - 1, PIECE + 3] {
+                let end = from + span;
+                let cuts = [
+                    scan_boundary(start, from, from),
+                    scan_boundary(start, from, from + span / 3),
+                    scan_boundary(start, from, from + 2 * span / 3),
+                    end,
+                ];
+                assert_eq!(cuts[0], from, "start {start} from {from}");
+                assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]), "start {start} from {from}");
+                assert_eq!((start + cuts[1]) % PIECE, 0);
+                assert_eq!((start + cuts[2]) % PIECE, 0);
+            }
+        }
+    }
+
+    /// The whole scan, not only its cuts: a differing byte in the first
+    /// thread's share of a span that begins inside a piece is found (the
+    /// wrapped cut of the first thread dropped its whole share).
+    #[test]
+    fn differing_pieces_of_a_big_unaligned_span_see_the_first_share() {
+        // Three threads (16 MiB each at least); bytes that differ in each
+        // thread's share, the first piece, and the last.
+        let span = 49 << 20;
+        for (start, from) in [(31, 0), (PIECE - 1, 0), (1, 31), (31, PIECE - 1)] {
+            let to = from + span;
+            let before = vec![0u8; span];
+            let mut data = vec![0u8; to];
+            for at in [from, from + 10, from + span / 6, from + span / 2, to - 1] {
+                data[at] = 1;
+            }
+            // SAFETY: `data` holds `to` bytes, `before` holds `span`; nothing
+            // writes them meanwhile.
+            let found = unsafe { differing_pieces(start, data.as_ptr() as usize, from, to, &before) };
+            let expected = serial(start, from, to, &data, &before);
+            assert!(expected.len() >= 4, "the model: the first piece, a piece in each of two thirds, the last");
+            assert_eq!(found, expected, "start {start} from {from}");
+        }
+    }
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -3317,51 +3448,10 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
-        let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
-            let mut found = Vec::new();
-            let mut at = a;
-            while at < b {
-                let n = (PIECE - (start + at) % PIECE).min(b - at);
-                // SAFETY: inside the mapping, which nothing writes while a
-                // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
-                    found.push((at, n));
-                }
-                at += n;
-            }
-            found
-        };
-        const PER_THREAD: usize = 16 << 20;
-        let threads = ((to - from) / PER_THREAD).clamp(1, 8);
-        if threads == 1 {
-            return scan(from, to);
-        }
-        // Cut on piece boundaries, so that every thread sees whole pieces.
-        let cut = |i: usize| {
-            if i == threads {
-                return to;
-            }
-            let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
-        };
-        let scan = &scan;
-        std::thread::scope(|s| {
-            let parts: Vec<_> = (0..threads)
-                .map(|i| {
-                    let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
-                })
-                .collect();
-            parts
-                .into_iter()
-                .flat_map(|part| match part.join() {
-                    Ok(found) => found,
-                    Err(panic) => std::panic::resume_unwind(panic),
-                })
-                .collect()
-        })
+        // SAFETY: `data` is the copy's mapping, which holds `[from, to)` (the
+        // range was cut with `inside`), and nothing writes it while a
+        // submission's results are compared.
+        unsafe { differing_pieces(self.start as usize, self.data as usize, from, to, before) }
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
