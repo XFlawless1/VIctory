@@ -580,6 +580,13 @@ the one three frames before), one 40 s run each: old 51 % (23 of 45), fix 0 % (0
 with the refreshes in front, which is what the cause above says. The pictures of the fix and of that control are the
 same ones (equal PNG sizes frame for frame).
 
+Also by that metric, the old behaviour with `VICTORY_TEXTURE_GUARD=0` (every check hashes): 51 % (29 of 57); with
+`VICTORY_TEXTURE_NO_WAIT=0`: 51 % (22 of 43). The log agrees: of the 128 checks of the three luma memories in presents
+345 to 468, 119 detiled a changed picture, 7 read it through the kernel, 2 found it unchanged, and none was passed over by
+the guard, so the guard and the hashing were not what held a picture back. The frame waits of the title all came from one
+thread (each kind), one flip wait before each present but two (the early present after a late one, the hitch above); two
+threads never shared a tick there (upstream 810f4422 is a real race of `frame::wait` but not what is seen here; not ported).
+
 Ruled out on the way, with the log of `VICTORY_INTRO_LOG` (the same run as above): the frame pacing (the title's
 Presents 33.3 ms apart with and without the fix; the flip wait blocks about 29 ms before each, the origin wait never,
 and a present is not a burst of three after a stall: the six presents of a cycle are 33.3 ms apart each); a slow movie
