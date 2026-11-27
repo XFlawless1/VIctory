@@ -102,6 +102,24 @@ impl Drop for Awake {
     }
 }
 
+/// The keep-awake queue's fence and the last value signalled on it, for
+/// the device-removed report ([`in_flight`]).
+struct Seen(ID3D12Fence);
+// SAFETY: fences are free-threaded; only `GetCompletedValue` is asked.
+unsafe impl Send for Seen {}
+// SAFETY: as above.
+unsafe impl Sync for Seen {}
+static FENCE: OnceLock<Seen> = OnceLock::new();
+static SENT: AtomicU64 = AtomicU64::new(0);
+
+/// The keep-awake queue's (reached, signalled) fence values; `None` if it
+/// never ran.
+pub(crate) fn in_flight() -> Option<(u64, u64)> {
+    let fence = FENCE.get()?;
+    // SAFETY: a plain query on a live fence.
+    Some((unsafe { fence.0.GetCompletedValue() }, SENT.load(Ordering::Relaxed)))
+}
+
 /// Keeps the card of `device` busy while `wanted`.
 pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -175,6 +193,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             lists.push(Some(list.cast::<ID3D12CommandList>()?));
         }
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let _ = FENCE.set(Seen(fence.clone()));
         let event = CreateEventW(None, false, false, None)?;
         let mut value = 0u64;
         let mut result = Ok(());
@@ -195,6 +214,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
             value += 1;
             result = queue.Signal(&fence, value);
+            SENT.store(value, Ordering::Relaxed);
         }
         if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
             WaitForSingleObject(event, INFINITE);

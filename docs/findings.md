@@ -598,3 +598,19 @@ reached the world with no device removal in the log; each had one or two windows
 4,300 ms a frame (the old and the fixed alike). What the fix adds is the card's copy of one movie frame (12.6 MB: the luma plane and two chroma
 planes) at each of the 30 presents a second, where it was every second one; the detiling was done at every present
 before.
+
+## Device-removed report: "nothing of ours was running" only when every submission had finished (Belobug PR #412, 2026-11-27)
+
+Ported from Belobug/VIctory-Belobug-AMD PR #412 (b8d0dd96, b90f6b6b), applied as it is. Diagnostics only: no behaviour
+changes and no switch. `host::removal_context` (what the log says when the host device is removed) called the submitting
+thread "between submissions (nothing of ours was running on the card)" whenever it was between two submissions. With
+`VICTORY_RELAY` the thread goes on while earlier submissions still run, so that line could be false. It now says "nothing
+of ours was running" only when started and finished submissions are equal (`removal_phase`; otherwise "N submissions of ours
+not finished: their lists may have been running on the card"), and adds the fences of the three queues that can hold work of
+ours: the drawing queue's (completed of signalled), the keep-awake queue's (`VICTORY_CARD_AWAKE`) and the relay's copy
+queue's (`VICTORY_RELAY_COPY`). Locks that are held elsewhere are tried, never waited for, since the report is written by
+whoever finds the device removed.
+
+Tests: `cargo test -p victory-gpu --features diagnostics --lib` 389 -> 390 (the new one is
+`the_removal_phase_counts_unfinished_submissions`). **Not exercised in a run**: no device was removed in any run here, so
+the new report text has only been seen through its unit test.
