@@ -303,3 +303,14 @@ What the gap says: the 45-57 ms is not the title's code, which fits in 33.3 ms o
 (recording draws, copies, uploads, the card). Not shown: the real floor under the cap (burning CPU in the list calls until
 the frame leaves 33.3 ms would give it; `VICTORY_BURN_CPU_US` burns on the submitting thread only), and whether the title
 takes other paths when no GPU result comes back (it did not stall or crash in this run).
+
+**0042's counters of the clamps (diagnostics: the frame line's neighbour "indirect clamps per frame").** kelvaroq's 0042
+counts the clamps of one execution or window by the kind of their records; here those are counted too, and so are our
+batches (`indirect::batch`, 256 jobs a pass): the passes, the executions that read them by kind, and what a batch held when
+it ended (mesh dispatches only, others only, both). The patch's other half (why a merge under flights' shader writes gave
+up, `VICTORY_LATE_WAIT=2` only) is not taken. In the cell (RTX 5080), 4,460 draws a frame: 155 passes a frame, none alone
+or in windows, 3,260-3,280 mesh dispatches, 900-910 dispatches, 260 draws and 83 indexed draws reading their records from
+them, in 25 batches of mesh dispatches only, 124 of dispatches and draws only and 6 of both; in the state with 6,200 draws:
+161-166 passes, 2,300-2,480 mesh dispatches, 940-960 dispatches, 18-20 batches of mesh only, 128-130 of the others, 15 of
+both. Two full waits for every earlier shader write per pass: about 310 a frame, against the title's own barrier groups' 690
+(the cell) to 780 (the other state).

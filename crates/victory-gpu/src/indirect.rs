@@ -402,6 +402,8 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    #[cfg(feature = "diagnostics")]
+    counted(spec.0, count.is_some());
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
@@ -422,8 +424,91 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
+    #[cfg(feature = "diagnostics")]
+    counted(spec.0, false);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+}
+
+/// Diagnostics, since the last frame line (after kelvaroq's 0042, which
+/// counted these two kinds of clamp): the clamps of one execution or one
+/// window (a pass of ours each, with two full waits) by the kind of their
+/// records (draws, indexed draws, dispatches, mesh dispatches), and of all
+/// those the ones with a count buffer.
+#[cfg(feature = "diagnostics")]
+static BOUNDED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Diagnostics: the executions whose records a batch ([`batch`]) clamps, by
+/// kind; the passes that opened batches; and the batches that closed, by the
+/// kinds of the executions they held (only mesh dispatches, only others, both).
+#[cfg(feature = "diagnostics")]
+static BATCHED: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// A kind of record (PC argument numbering) as a bit: draws 1, indexed draws
+/// 2, dispatches 4, mesh dispatches 8.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kind_bit(kind: u32) -> u8 {
+    match kind {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn counted(kind: u32, count: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BOUNDED[kind_bit(kind).trailing_zeros() as usize].fetch_add(1, Relaxed);
+    if count {
+        BOUNDED[4].fetch_add(1, Relaxed);
+    }
+}
+
+/// An execution of `kind` read its record from a batch's pass.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn counted_batched(kind: u32) {
+    BATCHED[kind_bit(kind).trailing_zeros() as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A batch ended; `kinds` are those of its executions.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_closed(kinds: u8) {
+    let class = match (kinds & 8 != 0, kinds & 7 != 0) {
+        (true, false) => 5,
+        (false, _) => 6,
+        (true, true) => 7,
+    };
+    BATCHED[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// For the frame-rate line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = BOUNDED.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let b = BATCHED.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let passes: f64 = b[5..].iter().sum();
+    if n[..4].iter().sum::<f64>() + passes > 0.0 {
+        tracing::info!(
+            "indirect clamps per frame, a pass of ours each with two full waits: alone or in windows {:.0} draws, {:.0} indexed draws, \
+             {:.0} dispatches, {:.0} mesh dispatches ({:.0} of them with a count buffer); batched: {passes:.0} passes in which {:.0} draws, \
+             {:.0} indexed draws, {:.0} dispatches, {:.0} mesh dispatches read their records (batches of mesh dispatches only {:.0}, of \
+             others only {:.0}, of both {:.0})",
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[5],
+            b[6],
+            b[7]
+        );
+    }
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
