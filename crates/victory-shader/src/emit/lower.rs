@@ -83,6 +83,9 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    /// Descriptor tables (a bit per root slot) whose constant buffers some load reads in a way the constant buffer
+    /// base cannot follow ([`Lower::cb_delta`]): redo with those tables read as the title's.
+    CbTaint(u64),
     Fail(ShaderError),
 }
 
@@ -112,8 +115,12 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // Tables left out of the constant buffer base (a bit per root slot).
+    let mut cb_off = 0u64;
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        let mut lower = Lower::new(parts, &bad);
+        lower.cb_off = cb_off;
+        match lower.run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -123,6 +130,8 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
                     });
                 }
             }
+            // (Each round adds tables: at most 64 of them.)
+            Err(Stop::CbTaint(tables)) => cb_off |= tables,
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -396,6 +405,13 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Tables (a bit per root slot) whose constant buffers are read where the title's table has them, whatever
+    /// [`super::shader::cb_base`] says, and the tables a load reads constant buffers of in a way the constant buffer
+    /// base cannot follow ([`Lower::cb_delta`]).
+    cb_off: u64,
+    cb_taint: u64,
+    /// Per table parameter: how far its constant buffers' slots lie from its table's, in bytes of the heap.
+    cb_deltas: HashMap<usize, V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2130,6 +2146,9 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            cb_off: 0,
+            cb_taint: 0,
+            cb_deltas: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2906,6 +2925,10 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // A table some load reads constant buffers of that the base cannot follow is read as the title's, whole.
+        if self.cb_taint & !self.cb_off != 0 {
+            return Err(Stop::CbTaint(self.cb_taint & !self.cb_off));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3315,6 +3338,12 @@ impl<'a> Lower<'a> {
     /// computes when it binds (`root` says what, an `Other` code of
     /// `shader.rs`), placed after the layout's own dwords.
     fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        self.host_word_at(root, slot, dword, false)
+    }
+
+    /// [`Lower::host_word`]; with `compact` the dword is placed right after the highest user-data dword the program can
+    /// read (not after all the layout's), so that the root constants stay as few as the program's own reads need.
+    fn host_word_at(&mut self, root: RootType, slot: u8, dword: u32, compact: bool) -> V {
         let known = self
             .user_reads
             .values()
@@ -3325,12 +3354,23 @@ impl<'a> Lower<'a> {
             None => {
                 let first = self.user_first();
                 let layout = &self.x.native.layout;
-                let mut index = layout
-                    .iter()
-                    .map(|e| u32::from(e.user_data) + e.sgprs)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_sub(first);
+                let mut index = if compact {
+                    // (Every user-data read a program makes is of a parameter in `params`: `Lower::user`.)
+                    self.params
+                        .values()
+                        .filter_map(|&(param, dword)| Some(u32::from(layout.get(param)?.user_data) + dword + 1))
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(first)
+                        .max(self.user_reads.keys().next_back().map_or(0, |last| last + 1))
+                } else {
+                    layout
+                        .iter()
+                        .map(|e| u32::from(e.user_data) + e.sgprs)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_sub(first)
+                };
                 while self.user_reads.contains_key(&index) {
                     index += 1;
                 }
@@ -8186,6 +8226,11 @@ impl<'a> Lower<'a> {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
+        // A per-lane load of a table that holds constant buffers is not followed by their base
+        // ([`Lower::cb_delta`]).
+        if !sampler && let Some(bit) = self.cb_table(a.param) {
+            self.cb_taint |= bit;
+        }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -8251,8 +8296,77 @@ impl<'a> Lower<'a> {
             let so = self.operand(li, soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
+        // A constant buffer of a table: its slot in the host's block of them, not in the title's table.
+        if !sampler && let Some(delta) = self.cb_delta(load, a, first) {
+            addr = self.s.m.bin(c, Bin::Add, addr, delta);
+        }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+    }
+
+    /// The bit of root slot `param`'s table in [`Lower::cb_off`] if constant buffers are read from a base of their own
+    /// ([`super::shader::cb_base`]) for that table: it is a table that holds constant buffers, and is not left out.
+    fn cb_table(&self, param: usize) -> Option<u64> {
+        if !super::shader::cb_base() {
+            return None;
+        }
+        let rp = self.x.native.layout.get(param)?;
+        if rp.root != RootType::Table || rp.slot >= 64 {
+            return None;
+        }
+        let bit = 1u64 << rp.slot;
+        let holds = self
+            .x
+            .native
+            .used
+            .iter()
+            .any(|u| u.root == RootType::Table && u.user_data == rp.user_data && u.kind == ResourceType::Cbv);
+        (holds && self.cb_off & bit == 0).then_some(bit)
+    }
+
+    /// For a load of a descriptor from a table the title holds constant buffers in
+    /// ([`super::shader::cb_base`]): how far the host has put the slots of the table's constant buffers from the table's
+    /// own, in bytes of the heap (the dword the host computes, [`super::shader::USER_CB_BASE`], less the table's), to
+    /// be added to the load's address. The load then reads the entry's slot of the host's block of constant buffer
+    /// views for this draw, and the title's table stays the title's own: nothing of it is made afresh. The host may
+    /// put the base where the table is (zero), as it does where it makes the table afresh.
+    ///
+    /// None for any load that is not of a constant buffer (a texture or buffer view of the same table is read in the
+    /// title's table as before). A load of a table with constant buffers whose entry the program computes (an index
+    /// from a register, a load per lane) is not followed: the table is marked for another round
+    /// ([`Stop::CbTaint`]) in which every load of it reads the title's table, constant buffers too.
+    fn cb_delta(&mut self, load: Site, a: Address, first: u8) -> Option<V> {
+        let bit = self.cb_table(a.param)?;
+        // (A waterfall loop's load reads each lane's own entry.)
+        if a.dynamic.is_some() || self.x.res.waterfall.loads.contains(&load) {
+            self.cb_taint |= bit;
+            return None;
+        }
+        let rp = *self.x.native.layout.get(a.param)?;
+        let dword = (a.offset / 4) + u32::from(first);
+        let used = self
+            .x
+            .native
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords <= dword)
+            .max_by_key(|u| u.table_offset_dwords)?;
+        if used.kind != ResourceType::Cbv {
+            return None;
+        }
+        if let Some(&delta) = self.cb_deltas.get(&a.param) {
+            return Some(delta);
+        }
+        let Val::I32(table) = self.user(a.param, 0) else {
+            self.cb_taint |= bit;
+            return None;
+        };
+        let cb = self.host_word_at(RootType::Other(super::shader::USER_CB_BASE), rp.slot, 0, true);
+        // (In the entry block, where the user data is read: it dominates every use.)
+        let entry = self.s.entry;
+        let delta = self.s.m.bin(entry, Bin::Sub, cb, table);
+        self.cb_deltas.insert(a.param, delta);
+        Some(delta)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

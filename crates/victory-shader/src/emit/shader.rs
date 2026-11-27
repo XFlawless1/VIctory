@@ -94,6 +94,12 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, with [`cb_base`]: where, in the view heap, the host
+/// has put the constant buffer views of the descriptor table of root parameter `slot`, as a byte offset in the heap
+/// like the table's own value. A constant buffer's entry `k` of the table is read at that base plus `32 * k`; every
+/// other entry of the table is read in the title's table as ever. The host makes the base the table's own where it makes
+/// the table afresh (zero distance), so the program reads one table then, as before.
+pub const USER_CB_BASE: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -183,6 +189,34 @@ pub fn set_raw_views(first: u32) {
     debug_assert!(first == 0 || first.is_power_of_two());
     RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
 }
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`cb_base`].
+    pub(crate) static CB_BASE_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the constant buffers of descriptor tables are read from a base of their own
+/// (`VICTORY_CB_BASE=0`: from the title's table, as before). A table that holds a constant buffer view was made
+/// afresh by the host for every draw, all its entries, textures and buffers too, because the constant buffer's view
+/// must point at a copy of its bytes made for the draw (the console takes constant buffers on 16 bytes, D3D12 views on
+/// 256, and the title rewrites them between draws). With the base the host makes only the constant buffer views, in a
+/// block of heap slots of its own ([`USER_CB_BASE`]), and the title's table stays the title's: its other entries are
+/// taken as the title's own tables' are. Part of the translation: the shader cache keys on the switch.
+pub fn cb_base() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CB_BASE_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CB_BASE") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => CB_BASE_DEFAULT,
+    })
+}
+
+/// What [`cb_base`] is without `VICTORY_CB_BASE`.
+const CB_BASE_DEFAULT: bool = false;
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
 pub fn raw_views() -> u32 {

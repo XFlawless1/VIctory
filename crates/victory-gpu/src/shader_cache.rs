@@ -140,6 +140,11 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Constant buffers of tables read from a base of their own (`VICTORY_CB_BASE`): only when on, so the
+        // translations cached without it keep their key.
+        if victory_shader::emit::cb_base() {
+            bytes.extend_from_slice(b"VICTORY_CB_BASE=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

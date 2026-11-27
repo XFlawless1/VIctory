@@ -24,6 +24,8 @@ pub mod console;
 #[cfg(windows)]
 mod compose;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod cbstat;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
