@@ -573,3 +573,21 @@ from 345, none kept). The zoom's step from one saved frame to the next (mean abs
 thumbnails) grows smoothly, 8.2, 8.9, 9.7, 10.2, ... 24.4 for frames 393 to 411, where before the fix it went 14, 13,
 -20, 14, 13, +26 (back to the first of the three, and on by two steps). The title's Presents with the fix are 33.33 ms
 apart (sd 0.21 ms, 124 gaps, none off by 3 ms), the upload costs nothing that shows there.
+
+The `flick_batch` metric (every third frame of 280 to 520 saved, logo frames over 400,000 bytes, share equal in size to
+the one three frames before), one 40 s run each: old 51 % (23 of 45), fix 0 % (0 of 44), old with `VICTORY_JOIN_PARTS=1`
+(the refreshes behind the steps, which costs the frame time `VICTORY_JOIN_PARTS=8` saves) 0 % (0 of 44): the repeat goes
+with the refreshes in front, which is what the cause above says. The pictures of the fix and of that control are the
+same ones (equal PNG sizes frame for frame).
+
+Ruled out on the way, with the log of `VICTORY_INTRO_LOG` (the same run as above): the frame pacing (the title's
+Presents 33.3 ms apart with and without the fix; the flip wait blocks about 29 ms before each, the origin wait never,
+and a present is not a burst of three after a stall: the six presents of a cycle are 33.3 ms apart each); a slow movie
+(a new picture in the movie's memory at every present); the clock, the update thread's waits, the loading work of that
+moment (one of the three luma memories changed at each of 119 presents of 119, both with and without the fix: nothing
+holds the title's update back). The title's frame interval is 33.333 ms, as it asks; there is no `VICTORY_FRAME_INTERVAL_MS`
+here and none was needed.
+
+Not shown: how this looks with Smooth Motion on (the frame generation was off in every run, `-NoSmoothMotion`); that
+other textures the title rewrites at every draw look better (the same step is taken for all of them); the world frame
+is told below once the runs are done.
