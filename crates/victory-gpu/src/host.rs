@@ -9092,7 +9092,13 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                // What is shown: the interface laid over the game when it was (`VICTORY_CAPTURE_GAME_PLANE=1`: the
+                // game's plane alone, as before; a loading screen or a title card lives on the interface plane and was
+                // saved black).
+                .then(|| {
+                    let shown = if crate::switch::on("VICTORY_CAPTURE_GAME_PLANE") { texture } else { laid.as_ref().unwrap_or(texture) };
+                    crate::capture::read_back(&self.device, list, shown)
+                })
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };

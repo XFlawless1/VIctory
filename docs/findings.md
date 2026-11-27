@@ -226,3 +226,27 @@ b4ba4bbb, bf7833a9, 9576c45f (the ambient stand-in settling by the clock, "rooms
 seconds after walking in"): conflicts in `descriptor/host.rs` and `host.rs`. The host-copy refresh, heap-record, guard
 and renderer-port commits are another piece of work's; FidelityFX, RX 9070 XT, output and scale switches, the frame
 rate switch and the cache-core affinity are not wanted.
+
+## The light stand-in settles by the clock (2026-11-27, ported from Belobug/VIctory-Belobug-AMD)
+
+`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh seconds>]]` (unset: `250,3`; `0`: the old 0.04 of the
+way a frame). The slow mean of the light around (the stand-in's memory of the room, 20 % of every pixel's estimate) used
+to follow by 0.04 a frame: 25 frames, 0.8 s at the console's 30 frames a second but 2 to 4 s at 7 to 13, so walking into a
+room left it too bright or too dark for seconds. Now it follows by a share of the time (the same a second whatever the
+frame rate), and a change of the mean by more than the jump factor (3, either way: a door, a lamp) is taken at once. The
+optional third number bounds the title's leftover by the estimate for that many seconds after such a jump (default 0: not
+done). Taken from b4ba4bbb and 9576c45f of that fork (GPL-3.0-or-later; its default is the same, from its
+`reports/LIGHT-POPIN.md`), without its light probe (`lightprobe.rs`, the sums in a fourth buffer) and without its filter
+of magenta probes (which it says AMD's uninitialised memory makes). This supersedes the entry above that left the series
+out for its conflicts: only the part in `ambient.rs` was needed.
+
+Tested: the settings parse (`settle_settings`), the share is the same a second at any frame rate, and the pass runs on
+the card (`the_slow_mean_follows_jumps_and_ages`: half the way, a jump up and down taken at once with the age restarted,
+no jump factor, the first frame). NOT shown: that rooms look better after walking in on this PC; no pictures compared.
+
+## The frame capture saves the picture that is shown
+
+`VICTORY_CAPTURE` read back the first plane (the game's) only, so every loading screen, title card and intro, which the
+Series S title draws on the second plane (the interface, laid over the game by `compose.rs`), was saved black. It now
+reads back the composed picture when the planes were laid over each other (`VICTORY_CAPTURE_GAME_PLANE=1`: the game's
+plane alone, as before).
