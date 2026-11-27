@@ -2543,8 +2543,12 @@ impl HostHeap {
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         let late = Some(crate::frame::current());
+        // A texture made while lists sent before it may still run: those read
+        // this slot by index, and must not find it ([`show_new_later`]; the
+        // upload ahead had no part in that: `VICTORY_AHEAD_SAFE=0`).
+        let after = if show_new_later() && crate::texture::ahead::safe() { job.begun_before().unwrap_or(0) } else { 0 };
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late };
+            let flip = Flip { after, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }

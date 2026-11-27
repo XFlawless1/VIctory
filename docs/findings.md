@@ -226,3 +226,43 @@ b4ba4bbb, bf7833a9, 9576c45f (the ambient stand-in settling by the clock, "rooms
 seconds after walking in"): conflicts in `descriptor/host.rs` and `host.rs`. The host-copy refresh, heap-record, guard
 and renderer-port commits are another piece of work's; FidelityFX, RX 9070 XT, output and scale switches, the frame
 rate switch and the cache-core affinity are not wanted.
+
+## Belobug #454: upload ahead, a copy that did not run, and a texture being taken (2026-11-27)
+
+`VICTORY_AHEAD_SAFE` (on; `=0`: as before; A/B-able in diagnostics builds). Ported by hand from Belobug/VIctory-Belobug-AMD
+#454 (by its author, GPL-3.0-or-later; its diff did not apply, this tree having `drain`, `IN_FLIGHT` and the order that
+removes a job from those on their way after its `then` calls, which are kept). In `texture/ahead.rs`, and a few lines of
+`descriptor/host.rs`:
+
+- A batch whose copy did not run ("uploads ahead did not run") was finished all the same: its textures counted as
+  uploaded (`there()`), their slots were shown, and lists did not upload them. Now they are the lists' (`LISTED`), what
+  waited for them is not called, and no flip is made.
+- `claim` made a texture `PENDING` and put it among those on their way only after its staging buffer was made. A list
+  about to record its own upload (`listed`) in that while found nothing to wait for and went on: two uploads of one
+  texture, and the one ahead later set `uploaded` and cleared `dirty` without looking at what the list had done. Now the
+  entry is made with the taking, under the lock the list's wait takes, and whoever finds it waits (a second asking
+  waits for a second at most, as lists do).
+- The slot flips of an upload ahead had `after: 0`, ignoring `VICTORY_SHOW_NEW_LATER`: lists sent before the texture was
+  made could read its slot by index. They now wait for the submissions begun when the texture was made, as the slots of
+  the texture pass do.
+
+**Does the bug exist here.** The code does what is said, shown by two tests (`texture::ahead::tests`), each run both ways:
+`a_copy_that_did_not_run_does_not_count_as_uploaded` (without the switch the texture is `there()` and uploaded, its
+`then` calls are called; with it none of that) and `a_list_waits_for_a_texture_that_is_being_taken` (a test-only gate holds
+`claim` between taking the texture and making the staging buffer: without the switch `listed` returns at once, with it
+the list waits until the upload has landed). It has not happened in a world run on this PC: no "uploads ahead did not run"
+and no "texture not detiled" in any of the 36 run logs of the scratchpad on 2026-11-27 11:30 (21 were left at noon; with
+`VICTORY_UPLOAD_AHEAD=1` all, at least 905,000 textures uploaded ahead in those 21: the failure path is not taken).
+The race of the second point does happen: see the runs below.
+
+**Runs** (Series S, 240 s, scripted to the prison cell; world = lines of 3,500+ draws a frame; one run each, on a PC whose
+memory was nearly all taken, 0.5 to 1.0 GB available at the lowest; `tx_old1` all four switches of the three ports 0,
+`tx_cache1` only `VICTORY_FILE_CACHE=1`, so `VICTORY_AHEAD_SAFE=0` too, `tx_all1` all four on). The statistics line of the
+uploads ahead now counts the lists' waits that found a texture taken and its upload not made yet: that is the race. With
+`VICTORY_AHEAD_SAFE=0` it was 92 of 1,768 waits in `tx_old1` and 99 of 1,710 in `tx_cache1` (each of them a list that went
+on to record its own upload beside the one ahead); with it, 14 of 1,774 in `tx_all1`, which waited instead. (The counts of the two kinds
+are not of the same events: a list that goes on may ask again for its other levels.) No "uploads ahead did
+not run", no "timed out", no device removal in any of the three. World frame median 47.3 ms (`tx_old1`), 47.9 (`tx_cache1`),
+44.5 (`tx_all1`); earlier runs of the base tree today were 41.0 to 47.6, so that is the PC's spread from run to run: no sign
+of a cost, and none of a gain. Uploads ahead 55,000 / 65,000 / 60,000 (the line is logged every 5,000), "slots shown after
+their upload ... not shown any more by then" 371 / 402 / 428. What was not seen: a copy that did not run, in the game.
